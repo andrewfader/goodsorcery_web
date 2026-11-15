@@ -230,6 +230,32 @@ jobs:
           GOODSORCERY_WEB_DATABASE_PASSWORD: ${{ secrets.GOODSORCERY_WEB_DATABASE_PASSWORD }}
           POSTMARK_API_TOKEN: ${{ secrets.POSTMARK_API_TOKEN }}
           GOODSORCERY_API_KEY: ${{ secrets.GOODSORCERY_API_KEY }}
+          # Optional: external Redis-compatible servers instead of the Valkey
+          # accessories (docs/DEPLOYMENT.md, "Valkey settings"). A role is
+          # external only when its _EXTERNAL variable is 1; its URL secret is
+          # then required. Unset keeps the in-cluster URLs.
+          KAMAL_VALKEY_JOBS_EXTERNAL: ${{ vars.KAMAL_VALKEY_JOBS_EXTERNAL }}
+          KAMAL_VALKEY_CACHE_EXTERNAL: ${{ vars.KAMAL_VALKEY_CACHE_EXTERNAL }}
+          KAMAL_VALKEY_CABLE_EXTERNAL: ${{ vars.KAMAL_VALKEY_CABLE_EXTERNAL }}
+          KAMAL_VALKEY_JOBS_URL: ${{ secrets.KAMAL_VALKEY_JOBS_URL }}
+          KAMAL_VALKEY_CACHE_URL: ${{ secrets.KAMAL_VALKEY_CACHE_URL }}
+          KAMAL_VALKEY_CABLE_URL: ${{ secrets.KAMAL_VALKEY_CABLE_URL }}
+          # Optional Valkey image and sizing (docs/DEPLOYMENT.md, "Valkey
+          # settings"), used when bin/boot_valkey_accessories boots a missing
+          # accessory below. Unset keeps the defaults in config/deploy.yml.
+          KAMAL_VALKEY_IMAGE: ${{ vars.KAMAL_VALKEY_IMAGE }}
+          KAMAL_VALKEY_JOBS_MAXMEMORY: ${{ vars.KAMAL_VALKEY_JOBS_MAXMEMORY }}
+          KAMAL_VALKEY_JOBS_POLICY: ${{ vars.KAMAL_VALKEY_JOBS_POLICY }}
+          KAMAL_VALKEY_JOBS_MEMORY_LIMIT: ${{ vars.KAMAL_VALKEY_JOBS_MEMORY_LIMIT }}
+          KAMAL_VALKEY_JOBS_ARGS: ${{ vars.KAMAL_VALKEY_JOBS_ARGS }}
+          KAMAL_VALKEY_CACHE_MAXMEMORY: ${{ vars.KAMAL_VALKEY_CACHE_MAXMEMORY }}
+          KAMAL_VALKEY_CACHE_POLICY: ${{ vars.KAMAL_VALKEY_CACHE_POLICY }}
+          KAMAL_VALKEY_CACHE_MEMORY_LIMIT: ${{ vars.KAMAL_VALKEY_CACHE_MEMORY_LIMIT }}
+          KAMAL_VALKEY_CACHE_ARGS: ${{ vars.KAMAL_VALKEY_CACHE_ARGS }}
+          KAMAL_VALKEY_CABLE_MAXMEMORY: ${{ vars.KAMAL_VALKEY_CABLE_MAXMEMORY }}
+          KAMAL_VALKEY_CABLE_POLICY: ${{ vars.KAMAL_VALKEY_CABLE_POLICY }}
+          KAMAL_VALKEY_CABLE_MEMORY_LIMIT: ${{ vars.KAMAL_VALKEY_CABLE_MEMORY_LIMIT }}
+          KAMAL_VALKEY_CABLE_ARGS: ${{ vars.KAMAL_VALKEY_CABLE_ARGS }}
         run: |
           missing=0
           # POSTMARK_API_TOKEN is optional: without it, mail goes through the
@@ -242,6 +268,9 @@ jobs:
           [ "$missing" = 0 ] || exit 1
           [ -n "$POSTMARK_API_TOKEN" ] || echo "::warning::POSTMARK_API_TOKEN is not set; mail needs SMTP configured instead"
           export KAMAL_IMAGE="${KAMAL_IMAGE:-${GITHUB_REPOSITORY,,}}"
+          # Boot any Valkey accessory the app needs that isn't on the server
+          # yet (and start a stopped one); running instances are never touched.
+          bin/boot_valkey_accessories
           bin/kamal deploy
 
       - name: Remove SSH key

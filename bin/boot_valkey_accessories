@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Boots each Valkey accessory the app needs that doesn't exist on the server
+# yet, and starts one that exists but is stopped. It never touches a running
+# instance or its data, and skips roles with KAMAL_VALKEY_<ROLE>_EXTERNAL=1.
+#
+# CI runs it right before bin/kamal deploy (.github/workflows/ci.yml), so a
+# deploy from GitHub needs no manual accessory boot, also for the move from one
+# Redis to three Valkey instances. .kamal/hooks/pre-deploy still checks the
+# result. It needs the same environment as bin/kamal deploy, and assumes the
+# accessories live on KAMAL_WEB_HOST, as in config/deploy.yml.
+set -euo pipefail
+
+service="${KAMAL_SERVICE:-goodsorcery_web}"
+host="${KAMAL_WEB_HOST:?KAMAL_WEB_HOST is not set}"
+kamal="${KAMAL_BIN:-bin/kamal}"
+
+trimmed() { printf '%s' "$1" | tr -d '[:space:]'; }
+
+# One "name state" line per container on the host, stopped ones included.
+containers=$(ssh -o BatchMode=yes -o ConnectTimeout=15 -p "${KAMAL_SSH_PORT:-22}" \
+  "${KAMAL_SSH_USER:-deploy}@$host" "docker ps --all --format '{{.Names}} {{.State}}'") || {
+  echo "boot_valkey_accessories: couldn't list the containers on $host over SSH." >&2
+  exit 1
+}
+
+for role in jobs cache cable; do
+  upper=$(printf '%s' "$role" | tr '[:lower:]' '[:upper:]')
+  flag="KAMAL_VALKEY_${upper}_EXTERNAL"
+  [ "$(trimmed "${!flag:-}")" = 1 ] && continue
+
+  accessory="valkey-$role"
+  state=$(printf '%s\n' "$containers" | awk -v name="$service-$accessory" '$1 == name { print $2 }')
+  case "$state" in
+    running) ;;
+    "") echo "Booting $accessory (not on $host yet)"; "$kamal" accessory boot "$accessory" ;;
+    created | exited) echo "Starting $accessory (stopped on $host)"; "$kamal" accessory start "$accessory" ;;
+    *) echo "Leaving $accessory alone ($state on $host); the pre-deploy check decides." ;;
+  esac
+done

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Stops a deploy before it touches any container when a Valkey accessory the
+# app needs isn't running, so the new app can't go live pointing at servers
+# that don't exist. Kamal runs this on the machine that deploys (a laptop or
+# CI), after the build, with KAMAL_HOSTS and every secret from .kamal/secrets
+# in the environment. See docs/DEPLOYMENT.md, "Valkey settings".
+set -euo pipefail
+
+runbook='docs/DEPLOYMENT.md, "Moving from one Redis to three Valkey instances"'
+service="${KAMAL_SERVICE:-goodsorcery_web}"
+
+fail() {
+  echo "pre-deploy: $*" >&2
+  exit 1
+}
+
+trimmed() { printf '%s' "$1" | tr -d '[:space:]'; }
+
+# A role with KAMAL_VALKEY_<ROLE>_EXTERNAL=1 uses its URL secret instead of
+# its accessory; every other role needs goodsorcery_web-valkey-<role>.
+needed=""
+for role in jobs cache cable; do
+  upper=$(printf '%s' "$role" | tr '[:lower:]' '[:upper:]')
+  flag="KAMAL_VALKEY_${upper}_EXTERNAL"
+  url="KAMAL_VALKEY_${upper}_URL"
+  if [ "$(trimmed "${!flag:-}")" = 1 ]; then
+    [ -n "$(trimmed "${!url:-}")" ] || fail "$flag=1 but $url is empty in .kamal/secrets."
+  else
+    needed="$needed $service-valkey-$role"
+  fi
+done
+
+# bin/kamal setup boots the accessories after this hook runs.
+[ "${KAMAL_COMMAND:-}" = setup ] && exit 0
+[ -n "$needed" ] || exit 0
+
+missing=""
+for host in ${KAMAL_HOSTS//,/ }; do
+  running=$(ssh -o BatchMode=yes -o ConnectTimeout=15 -p "${KAMAL_SSH_PORT:-22}" \
+    "${KAMAL_SSH_USER:-deploy}@$host" "docker ps --filter status=running --format '{{.Names}}'") ||
+    fail "couldn't list the running containers on $host over SSH."
+  for name in $needed; do
+    printf '%s\n' "$running" | grep -qx "$name" || missing="$missing $name ($host)"
+  done
+done
+
+[ -z "$missing" ] || fail "these Valkey accessories aren't running:$missing.
+Boot each one before deploying (bin/kamal accessory boot valkey-jobs, and so on),
+or set KAMAL_VALKEY_<ROLE>_EXTERNAL=1 for a role that uses an external server.
+Nothing was deployed. See $runbook."

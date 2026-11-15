@@ -78,5 +78,13 @@ module GoodsorceryWeb
     warn "Ignoring invalid ingest shedding settings: #{ingest_shedding.problem}. Using the defaults." if ingest_shedding.problem
     config.x.ingest.shed_after_seconds = ingest_shedding.shed_after
     config.x.ingest.resume_below_seconds = ingest_shedding.resume_below
+
+    # Where Ingest::QueueLatency reads the ingest queue: the Redis Sidekiq
+    # connects to. With no Sidekiq initializer, that is the variable named by
+    # REDIS_PROVIDER, else REDIS_URL (Sidekiq::RedisConnection); without
+    # either, Sidekiq's own localhost default. A future Sidekiq initializer
+    # that sets `config.redis` (TLS, a password) must set these options too,
+    # or every latency read fails and ingest never sheds.
+    config.x.ingest.queue_redis_options = { url: ENV[ENV["REDIS_PROVIDER"].to_s] || ENV["REDIS_URL"] }.compact
   end
 end

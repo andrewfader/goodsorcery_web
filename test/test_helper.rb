@@ -100,6 +100,20 @@ module ActiveSupport
       Rails.cache = previous
     end
 
+    # Ingest queue latency, in seconds, as Ingest::Backlog reads it (tests run
+    # jobs outside Sidekiq, where the real source always reads 0).
+    FixedQueueLatency = Struct.new(:seconds)
+
+    # Makes the process-wide Ingest::Backlog read an ingest queue latency of
+    # `seconds` (default thresholds 120 and 30).
+    def with_ingest_backlog(seconds, shed_after: 120, resume_below: 30)
+      previous = Ingest::Backlog.current
+      Ingest::Backlog.current = Ingest::Backlog.new(shed_after:, resume_below:, source: FixedQueueLatency.new(seconds))
+      yield
+    ensure
+      Ingest::Backlog.current = previous
+    end
+
     # Counts events toward this UTC month's total (the monthly quota) in an
     # environment no fixture rolls up, so the total doesn't depend on the date.
     def add_events_this_month(project, count)

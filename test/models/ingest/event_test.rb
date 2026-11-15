@@ -22,6 +22,27 @@ class Ingest::EventTest < ActiveSupport::TestCase
     assert_equal "undefined method `price_cents' for nil (cart [n], [email], card [FILTERED])", @event.redacted_message
   end
 
+  test "scrubs numeric tag values before storing them as strings" do
+    event = build_event(minimal_json(tags: { card: 4111111111111111 }))
+
+    assert_equal "[FILTERED]", event.tags["card"]
+    assert_equal "[FILTERED]", JSON.parse(event.to_payload_json).dig("tags", "card")
+  end
+
+  test "removes null bytes before scrubbing message secrets" do
+    event = build_event(minimal_json(exception: { message: "card 41111111\u000011111111 end" }))
+
+    assert_equal "card [FILTERED] end", event.message
+    assert_not_includes event.to_payload_json, "4111111111111111"
+  end
+
+  test "recognises sensitive param keys containing null bytes" do
+    event = build_event(minimal_json(request: { params: { "pass\u0000word" => "hunter2" } }))
+
+    assert_equal({ "password" => "[FILTERED]" }, event.request.params)
+    assert_equal({ "password" => "[FILTERED]" }, JSON.parse(event.to_payload_json)["params"])
+  end
+
   test "normalises frames, infers in_app and package names" do
     file, *others = @event.frames.map(&:file)
     assert_equal "app/services/cart_total.rb", file

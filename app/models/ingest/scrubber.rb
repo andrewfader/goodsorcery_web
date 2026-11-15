@@ -47,12 +47,12 @@ class Ingest::Scrubber
   # Scrubs before cutting to limit, so a cut can't leave part of a secret
   # (a card number's first digits fail the Luhn check) behind.
   def scrub_text(text, limit: nil)
-    scrubbed = scrub_secrets(text.to_s)
+    scrubbed = scrub_secrets(text.to_s.delete("\u0000"))
     limit ? Ingest::TreeLimiter.truncate(scrubbed, limit) : scrubbed
   end
 
   def sensitive_key?(key)
-    key = key.to_s
+    key = key.to_s.delete("\u0000")
     key.match?(KEY_PATTERN) || @extra_keys.any? { |extra| key.downcase.include?(extra) }
   end
 

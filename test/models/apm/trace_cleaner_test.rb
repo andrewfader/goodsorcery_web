@@ -24,4 +24,14 @@ class Apm::TraceCleanerTest < ActiveSupport::TestCase
   test "non-strings give nil" do
     assert_nil @cleaner.path(nil)
   end
+
+  test "null bytes are dropped, so Postgres can store the result" do
+    assert_equal "app/controllers/checkouts_controller.rb", @cleaner.file("app/controllers/\u0000checkouts_controller.rb")
+    assert_equal "/checkout", @cleaner.path("/check\u0000out")
+    assert_equal "api.example.com", @cleaner.host("api.\u0000example.com")
+  end
+
+  test "null bytes are dropped before scrubbing, so one can't split a secret" do
+    assert_equal "card [FILTERED]", @cleaner.text("card 41111111\u000011111111", 100)
+  end
 end

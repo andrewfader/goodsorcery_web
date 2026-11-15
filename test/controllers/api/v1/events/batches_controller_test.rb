@@ -298,4 +298,51 @@ class Api::V1::Events::BatchesControllerTest < ActionDispatch::IntegrationTest
       assert_equal({ "error" => "quota_exceeded" }, response.parsed_body)
     end
   end
+
+  class BacklogTest < ActionDispatch::IntegrationTest
+    include IngestTestSupport
+    include ActiveJob::TestHelper
+
+    setup do
+      @original_cache = Rails.cache
+      Rails.cache = ActiveSupport::Cache::MemoryStore.new
+    end
+
+    teardown { Rails.cache = @original_cache }
+
+    def post_batch(count, token = FIXTURE_TOKENS[:storefront_production])
+      post api_v1_events_batch_path, params: { events: Array.new(count) { JSON.parse(minimal_json) } }.to_json,
+           headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{token}" }
+    end
+
+    def counter(name, id) = Rails.cache.read("rate-limit:api/v1/events:#{name}:#{id}", raw: true).to_i
+
+    test "429 server_busy for the whole batch while the ingest queue is too far behind; nothing stored, enqueued or used up" do
+      with_ingest_backlog(150) do
+        assert_no_difference(-> { InboundEvent.count }) { post_batch 5 }
+      end
+
+      assert_response :too_many_requests
+      assert_equal({ "error" => "server_busy" }, response.parsed_body)
+      assert_equal "30", response.headers["Retry-After"]
+      assert_no_enqueued_jobs
+      assert_equal 0, counter("key", api_keys(:storefront_production).id)
+      assert_equal 0, counter("account", accounts(:acme).id)
+    end
+
+    test "a bad key still gets 401 while shedding" do
+      with_ingest_backlog(150) { post_batch 1, "gs_live_unknown" }
+      assert_response :unauthorized
+    end
+
+    test "accepts batches below the shed threshold" do
+      with_ingest_backlog(10) do
+        assert_difference(-> { InboundEvent.count }, 3) { post_batch 3 }
+      end
+
+      assert_response :accepted
+      assert_enqueued_jobs 3, only: ProcessInboundEventJob
+      assert_equal 3, counter("key", api_keys(:storefront_production).id)
+    end
+  end
 end

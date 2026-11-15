@@ -270,7 +270,7 @@ TEST_DB_SUFFIX=_mine bin/rails db:test:prepare test
 | Process | Command | Notes |
 |---|---|---|
 | Web | `./bin/thrust ./bin/rails server` (the Docker image's default) | Puma behind Thruster on port 80. `bin/docker-entrypoint` runs `bin/rails db:prepare` (create and migrate) before the server starts. |
-| Jobs | `bundle exec sidekiq -C config/sidekiq.yml` | **Required.** Ingest is accepted by the web process but **processed** by Sidekiq. Queues, by weight: `ingest` (3), `apm` (2, performance data), `default` (2, includes the uptime scheduler), `alerts` (2), `uptime` (2, the checks), `mailers` (1). It also runs the scheduled jobs. A process that leaves a queue out silently stops that work. |
+| Jobs | `bundle exec sidekiq -C config/sidekiq.yml` | **Required.** Ingest is accepted by the web process but **processed** by Sidekiq. Queues, by weight: `ingest` (3), `counters` (3, the 10-second counter flush), `apm` (2, performance data), `default` (2, includes the uptime scheduler), `alerts` (2), `uptime` (2, the checks), `mailers` (1). It also runs the scheduled jobs. A process that leaves a queue out silently stops that work. |
 | Valkey or Redis | Kamal accessories (three Valkey instances), or external | Valkey 7.2+ or Redis 7.0+. Sidekiq's server must not evict keys (`maxmemory-policy noeviction`) and should persist them; the cache store and Action Cable can have their own servers (`REDIS_CACHE_URL`, `REDIS_CABLE_URL`). |
 | Postgres | Kamal accessory, or external | 14 or newer, with `pg_trgm` available. |
 
@@ -288,9 +288,10 @@ Sidekiq, so nothing is scheduled there.
 
 | Job | Schedule | Rake task | What it does |
 |---|---|---|---|
+| `FlushIngestCountersJob` | every 10 seconds | none | Adds the event counts buffered in Valkey/Redis (issue counters, hourly counts, tag value counts) to Postgres. Issue and app counts and tag distributions on the dashboard lag by up to about 10 seconds. |
 | `PruneExpiredDataJob` | daily, 03:17 | `bin/rails goodsorcery:prune` | Deletes occurrences older than each app's `retention_days` (30, 60 or 90; default 30), hourly issue counts older than 31 days and app counts older than 90 days, stale personal data on issues past retention, inbound events never processed within a day, old alert deliveries, uptime history and performance data past its retention. |
 | `RequeueStaleEventsJob` | every 10 minutes | `bin/rails goodsorcery:requeue_stale` | Re-enqueues inbound events accepted more than 10 minutes ago but never processed (for example after a Redis outage). While the `ingest` queue is behind, it waits for the queue's current wait plus 5 minutes instead, and skips a run while the jobs it requeued last time are still queued, so it doesn't duplicate jobs that are still waiting. |
-| `CapStoredOccurrencesJob` | every 5 minutes | `bin/rails goodsorcery:cap_occurrences` | Holds each app to 3,000 stored occurrences: the issues with the most stored copies lose their oldest first, and every issue keeps at least its newest. Events are still counted. Each issue also keeps at most its newest 100 (`TrimOccurrencesJob`, every 50 events). |
+| `CapStoredOccurrencesJob` | every 5 minutes | `bin/rails goodsorcery:cap_occurrences` | Holds each app to 3,000 stored occurrences: the issues with the most stored copies lose their oldest first, and every issue keeps at least its newest. Events are still counted. Each issue also keeps at most its newest 100 (`TrimOccurrencesJob`, about one event in 50). |
 | `CheckStillHappeningJob` | every 5 minutes | none | Still-happening alerts for issues over their app's threshold in the last hour. |
 | `SendDailyDigestsJob` | hourly, :00 | none | Daily digests, sent at 09:00 in each recipient's time zone. |
 | `SendAlertSummariesJob` | hourly, :02 | none | One "and N more alerts" email per person for alerts over the hourly cap. |
@@ -318,6 +319,8 @@ Every variable below is read by the server's code or config.
 | `REDIS_URL` | **yes** | `redis://localhost:6379/1` (Action Cable), `redis://localhost:6379/0` (cache), Sidekiq's own default | Sidekiq's Valkey or Redis server (a `redis://` or `rediss://` URL, which may carry a password). Action Cable and the cache store use it too unless the next two are set. See "Valkey or Redis" for the server flags. |
 | `REDIS_CACHE_URL` | no | `REDIS_URL` | The Rails cache store's server (rate limits, quota and key-lookup caches, fragments). Falls back to `REDIS_URL`. |
 | `REDIS_CABLE_URL` | no | `REDIS_URL` | Action Cable's pub/sub server. Falls back to `REDIS_URL`. |
+| `REDIS_COUNTERS_URL` | no | `REDIS_URL` | Where ingest buffers event counts before flushing them to Postgres every 10 seconds. Must not evict keys: never point it at an LRU cache instance such as `REDIS_CACHE_URL`. Read once at boot. |
+| `GOODSORCERY_COUNTER_BUFFER` | no | on | `0`/`false`/`no`/`off` writes event counts straight to Postgres instead of buffering them (slower under heavy ingest; counts already buffered still flush). Read once at boot. |
 | `SIDEKIQ_CONCURRENCY` | no | `5` | Sidekiq threads per process. Keep `RAILS_MAX_THREADS` (the database pool) at least this high in the Sidekiq process. |
 | `RAILS_MAX_THREADS` | no | `3` Puma threads; database pool `5` | Puma threads per worker and the Active Record pool size. |
 | `WEB_CONCURRENCY` | no | Puma's default (1) | Puma worker processes. `auto` uses one per CPU. |
@@ -362,6 +365,7 @@ three roles, each read from its own variable:
 | Sidekiq jobs | `REDIS_URL` | none (required) | `--maxmemory-policy noeviction --appendonly yes --save ""` (the append-only file without RDB snapshots), plus a `--maxmemory` that fits the host |
 | Rails cache store | `REDIS_CACHE_URL` | `REDIS_URL` | `--maxmemory-policy allkeys-lru --save "" --appendonly no`, plus a `--maxmemory` |
 | Action Cable | `REDIS_CABLE_URL` | `REDIS_URL` | a small `--maxmemory` (32mb is plenty), `--save "" --appendonly no` |
+| Ingest counter buffer | `REDIS_COUNTERS_URL` | `REDIS_URL` | Sidekiq's flags: it must not evict keys and should persist them. Never the cache server |
 
 Sidekiq must never lose keys: with an evicting policy a full server silently
 drops queued jobs, retries and the cron schedule, and without persistence a
@@ -373,7 +377,7 @@ Sidekiq's flags), but costs two things. The cache can't use LRU eviction, so
 when memory runs out writes fail instead of old keys making room. And the cache
 store has no namespace, so `Rails.cache.clear` runs `FLUSHDB` on the shared
 database, deleting Sidekiq's queues, retries, scheduled jobs and cron schedule
-with it. Splitting them out takes three servers (or three managed instances)
+(and any buffered event counts) with it. Splitting them out takes three servers (or three managed instances)
 and the two extra variables; `config/deploy.yml` does it with three Valkey
 accessories. Managed services work too: put the password in the URL
 (`rediss://:PASSWORD@host:port/0` for TLS), and make sure the jobs instance is

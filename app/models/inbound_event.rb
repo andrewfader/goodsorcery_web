@@ -8,7 +8,10 @@ class InboundEvent < ApplicationRecord
 
   attribute :received_at, :datetime, default: -> { Time.current }
 
-  scope :stale, -> { where(received_at: ...10.minutes.ago) }
+  STALE_AFTER = 10.minutes
+
+  # Received over `after` ago and still here, so not processed (yet).
+  scope :stale, ->(after = STALE_AFTER) { where(received_at: ...after.ago) }
 
   class << self
     # Stores the events of one request for an authenticated key: one INSERT

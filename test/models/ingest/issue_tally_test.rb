@@ -26,8 +26,8 @@ class Ingest::IssueTallyTest < ActiveSupport::TestCase
 
     loser = Ingest::IssueTally.new(@project, @event)
     lookups = 0
-    real_lookup = loser.method(:existing_issue_id)
-    loser.define_singleton_method(:existing_issue_id) { (lookups += 1) == 1 ? nil : real_lookup.call }
+    real_lookup = loser.method(:find_snapshot)
+    loser.define_singleton_method(:find_snapshot) { (lookups += 1) == 1 ? nil : real_lookup.call }
 
     assert_no_difference -> { Issue.count } do
       assert_equal winner_id, loser.find_or_create_issue_id

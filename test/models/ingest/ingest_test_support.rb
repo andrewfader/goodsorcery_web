@@ -14,6 +14,26 @@ module IngestTestSupport
   Issue.prepend(BroadcastRecorder)
   Project.prepend(BroadcastRecorder)
 
+  # Stands in for the counter buffer: records what the processor counts,
+  # writes nothing (Ingest::CounterBuffer's interface).
+  class RecordingCounters
+    attr_reader :events
+
+    def initialize = @events = []
+
+    def buffered? = true
+
+    def add_event(**event) = events << event
+  end
+
+  # The SQL statements run inside the block, schema queries left out.
+  def capture_sql(&block)
+    statements = []
+    callback = ->(*, payload) { statements << payload[:sql] unless payload[:name] == "SCHEMA" }
+    ActiveSupport::Notifications.subscribed(callback, "sql.active_record", &block)
+    statements
+  end
+
   # The JSON of a sample event file with fresh timestamps and deep-merged overrides.
   def event_json(name = "full", overrides = {})
     template = EVENTS_DIR.join("#{name}.json").read

@@ -4,7 +4,7 @@ Client libraries (SDKs), such as the `goodsorcery` Ruby gem and the `goodsorcery
 
 **The API is language-neutral.** Clients send display-ready names and labels (exception classes, transaction names, file paths, runtimes, packages); the server stores, groups and renders them as sent and never needs to know which language or framework produced them. Anything a client can't fill in is optional. A few fallbacks exist for older Ruby clients and are marked as such.
 
-**Revision 1.1** (2026-11-08, additive: every 1.0 payload is still valid). See [Revisions](#revisions).
+**Revision 1.2** (2026-11-14, additive: every 1.0 and 1.1 payload is still valid). See [Revisions](#revisions).
 
 - **Endpoint:** `POST {endpoint}/api/v1/events` (one event), or `POST {endpoint}/api/v1/events/batch` (up to 100 events, see [Batches](#batches))
 - **Auth:** `Authorization: Bearer <api key>`
@@ -246,10 +246,11 @@ Scrub as much as you can **in the client** (the Ruby gem, for example, applies R
 | `422 Unprocessable Entity` | `{"error":"invalid_payload","messages":["exception.class is required"]}` | Valid JSON with the wrong shape. |
 | `429 Too Many Requests` | `{"error":"rate_limited"}` | Includes a `Retry-After` header in seconds (`60`). A rejected request uses up none of the key's or account's allowance. |
 | `429 Too Many Requests` | `{"error":"quota_exceeded"}` | The account has used its monthly event quota: on the hosted service, 3,000 error events per UTC month unless the account has another quota. Self-hosted instances have no quota. A changed quota applies at the next request; otherwise the answer can lag the count by a few minutes. |
+| `429 Too Many Requests` | `{"error":"server_busy"}` | *Revision 1.2.* The server is too far behind processing the events it already accepted (overloaded, or its processing workers are stopped) and turns new ones away for now. This can last until the server's operator fixes it, so a client should bound how many events it keeps queued. Includes a short `Retry-After` header in seconds (`30`). Nothing was stored, and none of the key's or account's allowance or quota was used. It applies to every key alike. |
 
-Checks run in this order: per-IP rate limit, API key (`401`), per-key and per-account rate limits, monthly quota, media type (`415`), body size (`413`), JSON (`400`), shape (`422`). For a batch, the per-key and per-account limits are charged one unit per event: one unit before the body is read (as for a single event, so a key or account with no room left gets `429` straight away), and the rest once the body is parsed and the `events` array checked (after `422` for a malformed array, before the events themselves are validated).
+Checks run in this order: per-IP rate limit, API key (`401`), server busy (`429 server_busy`), per-key and per-account rate limits, monthly quota, media type (`415`), body size (`413`), JSON (`400`), shape (`422`). For a batch, the per-key and per-account limits are charged one unit per event: one unit before the body is read (as for a single event, so a key or account with no room left gets `429` straight away), and the rest once the body is parsed and the `events` array checked (after `422` for a malformed array, before the events themselves are validated).
 
-Clients should retry `429` and `5xx` responses with backoff, reusing the same `event_id`. They should not retry `400`, `401`, `413`, `415` or `422`.
+Clients should retry `429` and `5xx` responses with backoff, reusing the same `event_id`. They should not retry `400`, `401`, `413`, `415` or `422`. On a `429`, wait the `Retry-After` seconds before sending anything else, then resend the events, keeping each one's `event_id` so an event stored twice is counted once. `server_busy` is not an error in the client's setup: keep the events queued rather than dropping them, and don't treat it as a `5xx` that uses up retries.
 
 ## Batches
 
@@ -262,7 +263,7 @@ Clients should retry `429` and `5xx` responses with backoff, reusing the same `e
 - The body is at most **2 MiB**, compressed and decompressed (`413` otherwise).
 - `events` must be an array of **1 to 100** events. A missing, non-array, empty or longer `events` array gets `422 {"error":"invalid_payload","messages":["events must be an array"]}` (or `events must not be empty`, `events must hold at most 100 events`) and nothing is stored.
 - Each event is validated exactly like a single request body and stored on its own. An event that does not validate, or that is over 512 KiB once re-serialised, is rejected by its index; the others are accepted.
-- Rate limits count **events**: a batch of 25 uses 25 of the key's and the account's per-minute allowance, the same allowance single events use one at a time. If the whole batch does not fit, it gets `429` with `Retry-After`, nothing is stored and nothing is used up. A batch refused as a whole with `400`, `413`, `415` or `422` uses one unit, like a single request. The per-IP limit counts requests.
+- Rate limits count **events**: a batch of 25 uses 25 of the key's and the account's per-minute allowance, the same allowance single events use one at a time. If the whole batch does not fit, it gets `429` with `Retry-After`, nothing is stored and nothing is used up. A `429 server_busy` (revision 1.2) also refuses the whole batch before its body is read, and uses up nothing. A batch refused as a whole with `400`, `413`, `415` or `422` uses one unit, like a single request. The per-IP limit counts requests.
 
 | Status | Body | Meaning |
 |---|---|---|
@@ -508,10 +509,11 @@ Oversized values are truncated rather than rejected (deeper nesting becomes `"[t
 
 ## Revisions
 
-The API version stays `v1`. Revisions only add fields or accepted forms; a payload valid under an earlier revision stays valid, and older servers ignore fields they don't know (so a client may send new fields to any server).
+The API version stays `v1`. Revisions only add fields, accepted forms or responses; a payload valid under an earlier revision stays valid, and older servers ignore fields they don't know (so a client may send new fields to any server).
 
 | Revision | Date | Changes |
 |---|---|---|
+| 1.2 | 2026-11-14 | The event endpoints (single and batch) can answer `429 {"error":"server_busy"}` with `Retry-After: 30` while the server is too far behind processing accepted events ([Responses](#responses)). Nothing is stored and no allowance or quota is used. Clients that already honour `Retry-After` on every `429` need no change. |
 | 1.1 | 2026-11-08 | Language-neutral contract. `context.runtime` and a trace's `runtime` take a list of `{ "name", "version" }` ([Runtimes](#runtimes)); the object form stays accepted. Frames gain optional `column`, `module` and `package` ([Frames](#frames)), and `in_app` should always be sent. The fourth performance layer is `app_ms` (app code); traces still accept `ruby_ms`, and the metrics tuple is unchanged. `view_ms` is documented as rendering, 0 when there is none. |
 | 1.0 | 2026-10-04 | First release (performance endpoints added 2026-11-04). |
 

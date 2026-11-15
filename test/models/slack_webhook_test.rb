@@ -91,7 +91,13 @@ class SlackWebhookTest < ActiveSupport::TestCase
   end
 
   test "an endless response is cut off by the connection's read cap and retried" do
-    serve { |_, client| client.write(http_response(200, {}, "x" * (UptimeProbe::MAX_READ_BYTES * 2))) }
+    # Keep writing until the client hangs up. A fixed-size body followed by
+    # an immediate close raced the client's read: the connection could end
+    # (ECONNRESET on CI) before the client had read past the cap.
+    serve do |_, client|
+      client.write("HTTP/1.1 200 OK\r\nContent-Length: #{UptimeProbe::MAX_READ_BYTES * 4}\r\n\r\n")
+      loop { client.write("x" * 16.kilobytes) }
+    end
 
     result = webhook.post({ text: "hi" })
 

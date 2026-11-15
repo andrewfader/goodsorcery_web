@@ -1,0 +1,7 @@
+# Ledger of applied counter chunks (CounterFlush): ids and a time only.
+# Ids are derived from the labels.
+recent:
+  created_at: <%= 1.hour.ago.to_fs(:db) %>
+
+expired:
+  created_at: <%= 9.days.ago.to_fs(:db) %>

@@ -45,8 +45,69 @@ class Ingest::ProcessorTest < ActiveSupport::TestCase
     savepoint = statements.index { it.start_with?("SAVEPOINT") }
     release = statements.rindex { it.start_with?("RELEASE SAVEPOINT") }
     assert_operator allocate, :<, savepoint, "number reserved outside the event transaction"
-    assert_match(/\AINSERT INTO "project_hourly_counts"/, statements[release - 1])
+    assert_match(/\AINSERT INTO project_hourly_counts/, statements[release - 1])
     assert_match(/FOR NO KEY UPDATE/, statements.find { it.include?("WITH previous AS") })
+  end
+
+  test "an event that can't change its issue takes the fast path: no issue lock, counters to the buffer" do
+    issue = process_event(event_json)
+    counters = RecordingCounters.new
+    inbound = inbound_event_for(event_json("full", user: { id: 9, email: "jo@example.com", username: "jo" }))
+
+    statements = capture_sql { @returned = Ingest::Processor.new(inbound, counters:).process }
+
+    assert_equal issue.id, @returned.id
+    assert_not statements.any? { it.include?("FOR NO KEY UPDATE") || it.match?(/\AUPDATE "?issues"?|issue_tag_counts.*ON CONFLICT/) }
+    event = counters.events.sole
+    assert_equal({ project_id: @project.id, environment: "production", occurred_at: inbound_occurred_at(inbound),
+                   received_at: inbound.received_at, occurrence_id: issue.occurrences.latest.id, issue_id: issue.id,
+                   new_user: true }, event.except(:tag_rows))
+    assert_equal IssueTagCount.where(issue_id: issue.id).pluck(:issue_id, :key, :value_digest).sort, event[:tag_rows].sort,
+                 "every tag value is stored already, so all of them are counted by the buffer"
+    assert_equal 1, issue.reload.events_count, "counted by the flush, not here"
+    assert_equal [ 1 ], IssueTagCount.where(issue_id: issue.id).distinct.pluck(:count)
+    assert_not InboundEvent.exists?(inbound.id)
+  end
+
+  test "with the buffer, only tag values the issue hasn't seen are inserted, with their encrypted value" do
+    issue = process_event(event_json)
+    counters = RecordingCounters.new
+    inbound = inbound_event_for(event_json("full", tags: { coupon: "WINTER5" }))
+
+    assert_difference -> { IssueTagCount.where(issue_id: issue.id).count } => 1 do
+      Ingest::Processor.new(inbound, counters:).process
+    end
+    added = IssueTagCount.find_by!(issue_id: issue.id, key: "coupon", value_digest: IssueTagCount.value_digest("coupon", "WINTER5"))
+    assert_equal [ "WINTER5", 1 ], [ added.value, added.count ]
+    assert_not_includes counters.events.sole[:tag_rows].map(&:second), "coupon"
+    assert_includes counters.events.sole[:tag_rows].map(&:second), "browser"
+  end
+
+  test "transitions take the slow path, and only the project hour goes to the buffer" do
+    issue = process_event(event_json)
+    slow = {
+      "a new environment" => -> { [ event_json, api_keys(:storefront_staging) ] },
+      "an event older than first_seen_at" => -> { [ event_json("full", occurred_at: 2.days.ago.utc.iso8601(3)), @key ] },
+      "a resolved issue" => -> { Issue.find(issue.id).resolve(by: users(:alex)) && [ event_json, @key ] }
+    }
+    slow.each do |reason, setup|
+      json, key = setup.call
+      counters = RecordingCounters.new
+      statements = capture_sql { Ingest::Processor.new(inbound_event_for(json, key:), counters:).process }
+
+      assert statements.any? { it.include?("FOR NO KEY UPDATE") }, reason
+      assert_equal [ %i[environment occurred_at occurrence_id project_id received_at tag_rows] ], counters.events.map { it.keys.sort },
+                   reason
+    end
+  end
+
+  test "events of an ignored issue take the fast path" do
+    issue = process_event(event_json)
+    Issue.find(issue.id).ignore(by: users(:alex))
+    counters = RecordingCounters.new
+
+    assert Ingest::Processor.new(inbound_event_for(event_json), counters:).process.ignored?
+    assert_equal issue.id, counters.events.sole[:issue_id]
   end
 
   test "groups two events with the same fingerprint into one issue" do
@@ -54,6 +115,7 @@ class Ingest::ProcessorTest < ActiveSupport::TestCase
     second = process_event(event_json("full", user: { id: 9, email: "jo@example.com", username: "jo" }))
 
     assert_equal first.id, second.id
+    second.reload
     assert_equal 2, second.events_count
     assert_equal 2, second.users_count
     assert_equal 2, second.occurrences.count
@@ -145,7 +207,7 @@ class Ingest::ProcessorTest < ActiveSupport::TestCase
 
     release = statements.rindex { it.start_with?("RELEASE SAVEPOINT") }
     activity = statements.index { it.start_with?('INSERT INTO "issue_activities"') }
-    assert_match(/\AINSERT INTO "project_hourly_counts"/, statements[release - 1])
+    assert_match(/\AINSERT INTO project_hourly_counts/, statements[release - 1])
     assert_operator activity, :>, statements.index { it.include?("WITH previous AS") }
     assert_operator activity, :<, release - 1
   end
@@ -254,11 +316,10 @@ class Ingest::ProcessorTest < ActiveSupport::TestCase
     assert_includes calls, [ "Issue", @issue.id, { created: false } ]
   end
 
-  test "enqueues trimming every TRIM_EVERY events" do
+  test "enqueues trimming when the one-in-TRIM_EVERY draw comes up" do
     issue = process_event(event_json)
-    Issue.where(id: issue.id).update_all(events_count: Ingest::Processor::TRIM_EVERY - 1)
-    assert_enqueued_with(job: TrimOccurrencesJob, args: [ issue ]) { process_event(event_json) }
-    assert_no_enqueued_jobs(only: TrimOccurrencesJob) { process_event(event_json) }
+    assert_enqueued_with(job: TrimOccurrencesJob, args: [ issue ]) { processor_with_trim_draw(true).process }
+    assert_no_enqueued_jobs(only: TrimOccurrencesJob) { processor_with_trim_draw(false).process }
   end
 
   test "discards malformed inbound events without raising" do
@@ -301,5 +362,15 @@ class Ingest::ProcessorTest < ActiveSupport::TestCase
       callback = ->(*, payload) { count += 1 unless payload[:name] == "SCHEMA" }
       ActiveSupport::Notifications.subscribed(callback, "sql.active_record", &block)
       count
+    end
+
+    def inbound_occurred_at(inbound)
+      Time.zone.parse(JSON.parse(inbound.body)["occurred_at"])
+    end
+
+    def processor_with_trim_draw(due)
+      Ingest::Processor.new(inbound_event_for(event_json)).tap do |processor|
+        processor.define_singleton_method(:trim_due?) { due }
+      end
     end
 end

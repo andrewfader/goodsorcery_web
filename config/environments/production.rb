@@ -46,6 +46,14 @@ Rails.application.configure do
   # Replace the default in-process memory cache store with a durable alternative.
   config.cache_store = :redis_cache_store, { url: ENV.fetch("REDIS_CACHE_URL") { ENV.fetch("REDIS_URL", "redis://localhost:6379/0") } }
 
+  # Ingest counters are buffered in Valkey/Redis and flushed to Postgres every
+  # 10 seconds (docs/ARCHITECTURE.md §2.5.2). REDIS_COUNTERS_URL, else
+  # REDIS_URL (the jobs instance), never REDIS_CACHE_URL: an LRU eviction
+  # would lose counts. GOODSORCERY_COUNTER_BUFFER=0 writes counters straight
+  # to Postgres instead; counts already buffered still flush.
+  config.x.counter_buffer_url = ENV["REDIS_COUNTERS_URL"].presence || ENV["REDIS_URL"].presence
+  config.x.counter_buffer_enabled = !%w[0 false no off].include?(ENV.fetch("GOODSORCERY_COUNTER_BUFFER", "1").strip.downcase)
+
   # Replace the default in-process and non-durable queuing backend for Active Job.
   config.active_job.queue_adapter = :sidekiq
 

@@ -68,6 +68,12 @@ module GoodsorceryWeb
     config.x.apm_retention_days = (ENV["GOODSORCERY_APM_RETENTION_DAYS"].presence || 30).to_i.clamp(1, 30)
 
     # Local testing of uptime checks against private addresses; never honoured in production.
+    # Ingest counter buffer (docs/ARCHITECTURE.md §2.5.2): off here, so
+    # development and test write counters straight to Postgres.
+    # config/environments/production.rb turns it on.
+    config.x.counter_buffer_url = nil
+    config.x.counter_buffer_enabled = false
+
     config.x.uptime.allow_private_addresses =
       ENV["GOODSORCERY_UPTIME_ALLOW_PRIVATE_ADDRESSES"] == "1" && !Rails.env.production?
 

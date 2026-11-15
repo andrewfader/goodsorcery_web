@@ -33,7 +33,7 @@ Redis-compatible server), so each gets the settings its data needs:
 
 | Accessory | Used by | Memory | When full | Persistence |
 |---|---|---|---|---|
-| `valkey-jobs` | Sidekiq (`REDIS_URL`) | 256 MB (container 384 MB) | refuses writes (`noeviction`, which Sidekiq requires) | append-only file only (no RDB snapshots) in `goodsorcery_web-valkey-jobs/data` under the deploy user's home |
+| `valkey-jobs` | Sidekiq and the ingest counter buffer (`REDIS_URL`) | 256 MB (container 384 MB) | refuses writes (`noeviction`, which Sidekiq requires) | append-only file only (no RDB snapshots) in `goodsorcery_web-valkey-jobs/data` under the deploy user's home |
 | `valkey-cache` | Rails cache store (`REDIS_CACHE_URL`) | 128 MB (container 160 MB) | evicts the least recently used keys | none |
 | `valkey-cable` | Action Cable (`REDIS_CABLE_URL`) | 32 MB (container 64 MB) | refuses writes | none |
 
@@ -278,6 +278,14 @@ without Cloudflare in front still refuses oversized uploads.
   is short and database-bound; a gem process sends at most two batches a
   minute. `GOODSORCERY_APM_RETENTION_DAYS` (self-hosted, 1–30, default 30)
   sets how long hourly figures and traces are kept.
+- **Ingest counters:** event counts are buffered in Valkey (`REDIS_COUNTERS_URL`,
+  else `REDIS_URL`, so `valkey-jobs` by default) and flushed to Postgres every 10 seconds on the `counters`
+  queue, so dashboard counts lag by about that much. The server must not evict
+  keys (never `valkey-cache`). `GOODSORCERY_COUNTER_BUFFER=0` writes
+  counts straight to Postgres instead. The flush holds a session-level
+  Postgres advisory lock, so its database connection must be session-pooled:
+  don't put PgBouncer in transaction mode between Sidekiq and Postgres. See
+  docs/ARCHITECTURE.md §2.5.2.
 - **Uptime checks:** they run on the `uptime` Sidekiq queue. A check waits on
   the network for up to about 20 seconds (two 10-second attempts), so one
   Sidekiq thread manages roughly 60 / (average check seconds) checks a minute,
@@ -456,7 +464,11 @@ container over its limit is OOM-killed and restarted:
   or a flood of ingest) and with the retry and dead sets. On 8 GB or more,
   512mb–1gb (limit 1.5 × that) buys more headroom for backlogs. Below 256mb,
   watch `used_memory` during bursts: a full `noeviction` server refuses new
-  jobs.
+  jobs. The ingest counter buffer shares this instance: its pending counts
+  are one small hash field per issue, hour and tag value touched in the last
+  10 seconds, plus a guard key of about 100 bytes per event for 2 minutes
+  (roughly 12 MB at a sustained 1,000 events a second). When the server is
+  full, events write their counts straight to Postgres instead.
 - **Cache (limit about 1.25 × maxmemory):** nothing is persisted, so nothing
   forks; the margin covers fragmentation from eviction churn. If it is ever
   exceeded, the restart only costs a cold cache. More memory means fewer
@@ -574,6 +586,11 @@ Do it in this order:
    - Don't rotate API keys during the deploy. A rotation on an old container
      clears the old cache only, so the new cache can keep accepting the old
      key for up to 5 minutes.
+   - If the release you are leaving already buffered ingest counters in the
+     old Redis (docs/ARCHITECTURE.md §2.5.2), the counts still pending there
+     at the switch, about 10 seconds' worth, are not carried over, so issue
+     and app counts end up that much low. Upgrading to the buffer and the
+     three instances in one deploy loses nothing.
 
 4. **Verify.** `bin/kamal logs -r job` should show Sidekiq starting without
    connection errors, and new events should appear in the dashboard. Events

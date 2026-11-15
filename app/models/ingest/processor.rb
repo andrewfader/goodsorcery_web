@@ -19,7 +19,7 @@ class Ingest::Processor
 
   attr_reader :inbound_event, :project
 
-  def initialize(inbound_event, counters: Ingest::DirectCounters.new)
+  def initialize(inbound_event, counters: Ingest::CounterBuffer.current)
     @inbound_event = inbound_event
     @project = inbound_event.project
     @counters = counters

@@ -19,7 +19,8 @@
 #   performance batches after ApmInboundBatch::KEPT_FOR;
 # - personal access tokens revoked or expired more than
 #   PersonalAccessToken::KEPT_AFTER_END ago (their audit rows cascade), and
-#   MCP audit rows older than AccessTokenActivity::KEPT_FOR.
+#   MCP audit rows older than AccessTokenActivity::KEPT_FOR;
+# - counter flush ledger rows (ids only) older than CounterFlush::KEPT_FOR.
 class Ingest::Retention
   # The issue chart's 30d view reaches back 30 local days; one more covers
   # any time zone offset. Nothing reads issue counts further back, so they
@@ -49,6 +50,7 @@ class Ingest::Retention
     prune_uptime
     prune_apm
     prune_access_tokens
+    prune_counter_flushes
   end
 
   # One batched delete per distinct retention period, not per project.
@@ -86,6 +88,10 @@ class Ingest::Retention
     ended = @now - PersonalAccessToken::KEPT_AFTER_END
     PersonalAccessToken.where(revoked_at: ...ended).or(PersonalAccessToken.where(expires_at: ...ended)).in_batches(of: BATCH).delete_all
     AccessTokenActivity.where(created_at: ...(@now - AccessTokenActivity::KEPT_FOR)).in_batches(of: BATCH).delete_all
+  end
+
+  def prune_counter_flushes
+    CounterFlush.where(created_at: ...(@now - CounterFlush::KEPT_FOR)).in_batches(of: BATCH).delete_all
   end
 
   def prune_alert_deliveries

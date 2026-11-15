@@ -145,6 +145,18 @@ class Ingest::AlertFlagsTest < ActiveSupport::TestCase
     assert_empty alert_job_args
   end
 
+  test "a counter buffer that fails after commit never skips the announcements or the alerts" do
+    failing = Object.new
+    def failing.with = raise(ArgumentError, "simulated bug")
+    counters = Ingest::CounterBuffer.new(failing, namespace: "test:failing")
+
+    issue = nil
+    calls = recording_broadcasts { issue = Ingest::Processor.new(inbound_event_for(event_json), counters:).process }
+
+    assert_equal [ [ issue.id, "new_issue", issue.occurrences.sole.id ] ], alert_job_args
+    assert_includes calls, [ "Issue", issue.id, { created: true } ]
+  end
+
   private
     def alert_job_args
       enqueued_jobs.select { |job| job["job_class"] == "IssueAlertJob" }.map { |job| job["arguments"] }

@@ -6,6 +6,15 @@ class Ingest::RetentionTest < ActiveSupport::TestCase
                         received_at:, environment: "production", level: "error", payload: "{}" }, returning: %i[id]).rows.first.first
   end
 
+  test "prunes counter flush ledger rows once no buffered batch can still need them" do
+    recent, expired = counter_flushes(:recent).id, counter_flushes(:expired).id
+    Ingest::Retention.new.prune_counter_flushes
+
+    assert CounterFlush.exists?(recent)
+    assert_not CounterFlush.exists?(expired)
+    assert_operator CounterFlush::KEPT_FOR, :>, Ingest::CounterBuffer::KEY_TTL
+  end
+
   test "prunes occurrences past each project's retention period" do
     storefront_old = add_occurrence(issues(:card_error), 31.days.ago)
     storefront_recent = add_occurrence(issues(:card_error), 29.days.ago)

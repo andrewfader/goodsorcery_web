@@ -4,7 +4,7 @@ Design notes for contributors. This document describes how Good Sorcery is put t
 
 Read the sections for the area you are changing before you change it, especially the ground rules (§0), encryption (§1.4), the ingest pipeline (§2), authorization (§6) and the security checklist (§9). `docs/INGEST_API.md` is the public payload spec for client authors, and `CLAUDE.md` / `CONTRIBUTING.md` hold the day-to-day conventions.
 
-Stack: Ruby 4.0.7, Rails 8.1.4, Postgres (pg_trgm), Propshaft, importmap, Turbo, Stimulus, tailwindcss-rails 4 (Tailwind v4), Sidekiq and Redis in production, async adapters in development. There are no Solid gems.
+Stack: Ruby 4.0.7, Rails 8.1.4, Postgres (pg_trgm), Propshaft, importmap, Turbo, Stimulus, tailwindcss-rails 4 (Tailwind v4), Sidekiq, the Redis cache store and Action Cable's Redis adapter in production (any Redis-compatible server; the Kamal deploy runs one Valkey each for jobs, cache and cable via `REDIS_URL`, `REDIS_CACHE_URL` and `REDIS_CABLE_URL`), async adapters in development. There are no Solid gems.
 
 ---
 
@@ -367,7 +367,7 @@ The two ingest controllers include the `IngestEndpoint` concern, which holds eve
 - **Auth:** `Authorization: Bearer <api key>` (`ApiKeyAuthentication`). Any other scheme or a missing header returns 401.
 - **Content-Type:** must be `application/json` (415 otherwise). `Content-Encoding: gzip` is supported.
 - **Size cap:** 512 KiB (2 MiB for a batch) for both the compressed and the decompressed body. `Ingest::RequestBody#read` (`max:`) rejects early when `Content-Length` > cap and reads gzip with `Zlib::GzipReader#read(cap + 1)` to defend against zip bombs. Oversized bodies return 413.
-- **Rate limits** (store = `Ingest::RateLimitStore`, i.e. `Rails.cache`, so Redis in production; fixed one-minute windows):
+- **Rate limits** (store = `Ingest::RateLimitStore`, i.e. `Rails.cache`, so the cache's Valkey/Redis in production; fixed one-minute windows):
   1. `rate_limit to: 6_000, within: 1.minute, by: -> { request.remote_ip }, name: "ip", scope: "api/v1/events"` (Rails 8 `rate_limit`, declared first; it counts requests and the scope makes the counter shared by both ingest endpoints)
   2. `before_action :authenticate_api_key`
   3. `before_action :limit_event_rate`: `Ingest::EventRateLimit` takes events from two `Ingest::RateCounter`s, per key (1,200/min) and per account (6,000/min), with the keys `rate-limit:api/v1/events:key:<id>` and `…:account:<id>`. Rails' `rate_limit` can only add 1, so these counters `increment` by N (`expires_in` = window). Admission is all or nothing; a rejected amount is given back. Both endpoints take 1 here (`IngestEndpoint#limit_event_rate`), so every request that reaches the body costs at least one unit. The batch endpoint takes the other N − 1 in `#create` once the body is parsed and the `events` array checked; if they don't fit it gives the first unit back too, so a 429 uses up nothing.
@@ -855,7 +855,7 @@ There is no chart JS, because all charts are server-rendered SVG (§7.4).
 
 ## 5. Caching plan
 
-**Store:** memory store in development, null store in test, Redis cache store in production. Fragment caching applies when `perform_caching` is on.
+**Store:** memory store in development, null store in test, Redis cache store in production (`REDIS_CACHE_URL`, else `REDIS_URL`; the Kamal deploy gives it its own Valkey with `allkeys-lru` and no persistence, so it never shares a database with Sidekiq: the store has no namespace and `clear` would flush Sidekiq's queues). Fragment caching applies when `perform_caching` is on.
 
 | What | Key | TTL | Owner |
 |---|---|---|---|

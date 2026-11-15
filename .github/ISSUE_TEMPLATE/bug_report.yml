@@ -50,4 +50,4 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: How you deploy (Kamal, Docker, other), Postgres and Redis versions, browser, and the client library and version if ingest is involved.
+      description: How you deploy (Kamal, Docker, other), Postgres and Valkey or Redis versions, browser, and the client library and version if ingest is involved.

@@ -4,7 +4,9 @@ development:
 test:
   adapter: test
 
+# REDIS_CABLE_URL gives Action Cable its own Redis-compatible server (pub/sub
+# only, nothing to persist); without it, Action Cable shares REDIS_URL.
 production:
   adapter: redis
-  url: <%= ENV.fetch("REDIS_URL") { "redis://localhost:6379/1" } %>
+  url: <%= ENV.fetch("REDIS_CABLE_URL") { ENV.fetch("REDIS_URL", "redis://localhost:6379/1") } %>
   channel_prefix: goodsorcery_web_production

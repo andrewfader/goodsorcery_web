@@ -13,7 +13,7 @@ Client libraries (SDKs), such as the `goodsorcery` Ruby gem and the `goodsorcery
 - **Key check:** `GET {endpoint}/api/v1/verify` confirms a key without sending an event (see [Verifying a key](#verifying-a-key)).
 - **Performance data:** `POST {endpoint}/api/v1/apm/metrics` and `POST {endpoint}/api/v1/apm/traces` (see [Performance monitoring](#performance-monitoring-apm)).
 
-API keys are **ingest-only** and belong to one project environment (for example `production` or `staging`). A key can only submit events. It cannot read anything. Keep keys in server-side configuration and never ship them to browsers or mobile apps.
+API keys are **ingest-only** and belong to one project environment (for example `production` or `staging`). A key can only submit events. It cannot read anything.
 
 ---
 

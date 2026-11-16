@@ -20,10 +20,28 @@ visitor ──HTTPS──▶ Cloudflare (DNS proxy, TLS)
   server ┌──────────────────────── Docker network "kamal" ───────────────────────┐
          │ goodsorcery_web-tunnel (cloudflared) ──HTTP──▶ kamal-proxy ──▶ web     │
          │                                                               job (Sidekiq + sidekiq-cron)
-         │ goodsorcery_web-db (Postgres 18)    goodsorcery_web-redis (Redis 8)    │
+         │ goodsorcery_web-db (Postgres 18)                                       │
+         │ goodsorcery_web-valkey-jobs  (Valkey 9.1: Sidekiq, persisted)          │
+         │ goodsorcery_web-valkey-cache (Valkey 9.1: Rails cache, LRU)            │
+         │ goodsorcery_web-valkey-cable (Valkey 9.1: Action Cable pub/sub)        │
          └────────────────────────────────────────────────────────────────────────┘
   open inbound ports: SSH only (key only, on KAMAL_SSH_PORT). No HTTP ports are published.
 ```
+
+Sidekiq, the Rails cache and Action Cable each have their own Valkey (a
+Redis-compatible server), so each gets the settings its data needs:
+
+| Accessory | Used by | Memory | When full | Persistence |
+|---|---|---|---|---|
+| `valkey-jobs` | Sidekiq and the ingest counter buffer (`REDIS_URL`) | 256 MB (container 384 MB) | refuses writes (`noeviction`, which Sidekiq requires) | append-only file only (no RDB snapshots) in `goodsorcery_web-valkey-jobs/data` under the deploy user's home |
+| `valkey-cache` | Rails cache store (`REDIS_CACHE_URL`) | 128 MB (container 160 MB) | evicts the least recently used keys | none |
+| `valkey-cable` | Action Cable (`REDIS_CABLE_URL`) | 32 MB (container 64 MB) | refuses writes | none |
+
+Keeping the cache apart also means a cache flush can't touch the job queues:
+the cache store has no namespace, so `Rails.cache.clear` empties its whole
+database. These are the defaults; every setting can be changed, and any role
+can use an external server instead, through the optional variables in
+[Valkey settings](#valkey-settings).
 
 ## Keeping the server private in a public repo
 
@@ -69,8 +87,25 @@ ufw default deny incoming && ufw allow OpenSSH && ufw --force enable   # or: ufw
 ```
 
 Docker-published ports bypass `ufw`, which is why `deploy.yml` publishes none:
-kamal-proxy runs with `publish: false`, and Postgres, Redis and cloudflared
+kamal-proxy runs with `publish: false`, and Postgres, Valkey and cloudflared
 only listen on the private `kamal` network.
+
+Valkey also needs two host settings, which Kamal doesn't manage. The jobs
+instance forks to rewrite its append-only file, and without memory overcommit
+that fork can fail; a small swap file keeps a memory spike on a 4 GB server
+from waking the OOM killer:
+
+```sh
+# Let Valkey fork for background saves (it warns at startup without this).
+echo 'vm.overcommit_memory = 1' > /etc/sysctl.d/90-valkey.conf
+sysctl --system
+
+# A 2 GB swap file (1 GB is enough if disk is tight). Skip if `swapon --show`
+# already lists one.
+fallocate -l 2G /swapfile && chmod 600 /swapfile
+mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+```
 
 ### 2. Cloudflare
 
@@ -141,6 +176,7 @@ only `main`. Then add:
 | secret | `ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT` | from `db:encryption:init` |
 | secret | `GOODSORCERY_WEB_DATABASE_PASSWORD` | the database password |
 | secret | `POSTMARK_API_TOKEN` | optional: the Postmark **server** API token (Servers → your server → API Tokens); without it, configure SMTP |
+| secret | `KAMAL_VALKEY_JOBS_URL`, `KAMAL_VALKEY_CACHE_URL`, `KAMAL_VALKEY_CABLE_URL` | optional: an external Redis-compatible server's URL for that role, used only with the matching `_EXTERNAL` variable below (see [Valkey settings](#valkey-settings)); `.kamal/secrets` already reads them |
 | secret | `GOODSORCERY_API_KEY` | optional: an ingest key for an app that tracks this instance's own errors (create the app on this instance or another one); unset, the gem sends nothing. See "Self-reporting" in the README |
 | variable | `GOODSORCERY_HOST` | the public hostname, e.g. `errors.example.com` |
 | variable | `GOODSORCERY_MAIL_FROM` | optional: the sender, e.g. `Good Sorcery <no-reply@example.com>`; defaults to `no-reply@GOODSORCERY_HOST` |
@@ -148,6 +184,7 @@ only `main`. Then add:
 | variable | `GOODSORCERY_ENABLE_SIGNUPS` | optional: `1` keeps public sign-up open after the first account; unset or anything else closes it |
 | variable | `KAMAL_IMAGE` | optional: the GHCR image name without `ghcr.io/`, e.g. `your-user/goodsorcery_web` (lowercase). CI defaults it to the repository's own name; Kamal's own default is `creativesorcery/goodsorcery_web`, which only the upstream repository can push to |
 | variable | `KAMAL_SSH_USER` | optional: the server user Kamal logs in as, if not `deploy` |
+| variable | `KAMAL_VALKEY_JOBS_EXTERNAL`, `KAMAL_VALKEY_CACHE_EXTERNAL`, `KAMAL_VALKEY_CABLE_EXTERNAL` | optional: `1` runs that role on the external server in its URL secret above instead of its Valkey accessory; unset keeps the accessory |
 | variable | `GOODSORCERY_HOSTED` | optional: `1` turns on hosted mode (entitlements and "Upgrade to unlock"); unset is self-hosted. After switching, run `goodsorcery:fit_entitlements` (see below) |
 | variable | `GOODSORCERY_APM_RETENTION_DAYS` | optional, self-hosted only: days of performance data to keep, 1–30 (default 30) |
 | variable | `GOODSORCERY_UPGRADE_URL` | optional, hosted only: where "Upgrade to unlock" links to. Unset, locked options say "Coming soon" and no upgrade text shows |
@@ -187,10 +224,18 @@ GitHub personal access token with `read:packages` as `KAMAL_REGISTRY_PASSWORD`
 and your GitHub username as `KAMAL_REGISTRY_USERNAME`):
 
 ```sh
-bin/kamal accessory boot all     # Postgres, Redis and the tunnel
+bin/kamal accessory boot all     # Postgres, the three Valkey instances and the tunnel
 ```
 
-Then push to `main` (or re-run the latest CI run). The deploy job starts
+To run a Valkey role on an external server, boot the accessories by name and
+leave that one out (see [Valkey settings](#valkey-settings)).
+
+Then push to `main` (or re-run the latest CI run). The CI deploy job first
+runs `bin/boot_valkey_accessories`, which boots any Valkey accessory not yet on
+the server. Every deploy then runs
+`.kamal/hooks/pre-deploy`, which stops it, before any container changes, if a
+Valkey accessory the app needs isn't running (see
+[The pre-deploy check](#the-pre-deploy-check)). The deploy job starts
 kamal-proxy, boots the web and job containers and runs migrations
 (`bin/docker-entrypoint` runs `db:prepare`; it never loads the development
 demo data in `db/seeds.rb`).
@@ -208,7 +253,9 @@ It prompts for the password without echoing it; add `STAFF=1` inside the
 quotes to also grant the staff area. Or, without that variable, open
 `https://GOODSORCERY_HOST` and sign up the moment the deploy finishes; sign-up
 closes after the first account. Grant staff later with
-`bin/kamal app exec --reuse 'bin/rails goodsorcery:make_staff EMAIL=you@example.com'`.
+`bin/kamal app exec -r web --reuse 'bin/rails goodsorcery:make_staff EMAIL=you@example.com'`.
+(`-r web` runs a command once. Without it, a non-interactive `app exec` runs
+once per role, so in both the web and the job container, even with `--reuse`.)
 
 Request bodies over 4 MiB get a 413 before they are read: Puma enforces
 `http_content_length_limit` (`config/puma.rb`) and Thruster `MAX_REQUEST_BODY`
@@ -225,12 +272,20 @@ without Cloudflare in front still refuses oversized uploads.
   container (the full list is under "Scheduled tasks" in the README), so the
   server needs no cron. If the job container is down, retention, alerts,
   digests and uptime checks all stop. The rake tasks still work by hand:
-  `bin/kamal app exec "bin/rails goodsorcery:prune"`.
+  `bin/kamal app exec -r web "bin/rails goodsorcery:prune"`.
 - **Performance data:** batches from the gem (`config.performance_monitoring`)
   are processed on the `apm` Sidekiq queue (weight 2, after `ingest`). Each job
   is short and database-bound; a gem process sends at most two batches a
   minute. `GOODSORCERY_APM_RETENTION_DAYS` (self-hosted, 1–30, default 30)
   sets how long hourly figures and traces are kept.
+- **Ingest counters:** event counts are buffered in Valkey (`REDIS_COUNTERS_URL`,
+  else `REDIS_URL`, so `valkey-jobs` by default) and flushed to Postgres every 10 seconds on the `counters`
+  queue, so dashboard counts lag by about that much. The server must not evict
+  keys (never `valkey-cache`). `GOODSORCERY_COUNTER_BUFFER=0` writes
+  counts straight to Postgres instead. The flush holds a session-level
+  Postgres advisory lock, so its database connection must be session-pooled:
+  don't put PgBouncer in transaction mode between Sidekiq and Postgres. See
+  docs/ARCHITECTURE.md §2.5.2.
 - **Uptime checks:** they run on the `uptime` Sidekiq queue. A check waits on
   the network for up to about 20 seconds (two 10-second attempts), so one
   Sidekiq thread manages roughly 60 / (average check seconds) checks a minute,
@@ -243,24 +298,192 @@ without Cloudflare in front still refuses oversized uploads.
   the queue.
   After switching `GOODSORCERY_HOSTED` on or off, or editing
   `config/entitlements.yml`, run
-  `bin/kamal app exec "bin/rails goodsorcery:fit_entitlements"` (formerly
+  `bin/kamal app exec -r web "bin/rails goodsorcery:fit_entitlements"` (formerly
   `goodsorcery:fit_uptime_monitors`, still an alias). It fits uptime monitors
   and each app's error retention. Switching it off without the task leaves
   monitors paused under hosted limits unchecked.
 - **Accessories:** `bin/kamal accessory logs tunnel`. Upgrading Postgres to a
   new major version needs a dump and restore.
+- **Valkey memory:** `bin/kamal accessory exec valkey-jobs --reuse "valkey-cli info memory"`
+  (likewise `valkey-cache` and `valkey-cable`) shows `used_memory_human`
+  against `maxmemory_human`. A full `valkey-jobs` refuses new jobs, so if it
+  creeps towards its limit, look for a growing queue or dead set in the
+  Sidekiq logs, and raise `KAMAL_VALKEY_JOBS_MAXMEMORY` and
+  `KAMAL_VALKEY_JOBS_MEMORY_LIMIT` together ([Sizing](#sizing)). A full
+  `valkey-cache` is normal: it evicts old keys.
 
 ## Other variables
 
 `config/deploy.yml` passes only some of the README's environment variables to
 the containers: the required ones and the optional variables listed in the
 table above. To use another one (for example `GOODSORCERY_EXTRA_HOSTS`,
-`GOODSORCERY_DOCS_URL`, `REDIS_CACHE_URL`, `SIDEKIQ_CONCURRENCY`,
+`GOODSORCERY_DOCS_URL`, `SIDEKIQ_CONCURRENCY`,
 `WEB_CONCURRENCY`, or `SMTP_USERNAME` / `SMTP_PASSWORD`), add it to `env.clear`
 (or `env.secret` and `.kamal/secrets` for secrets) in `config/deploy.yml`, and
 to the deploy step's `env` in `.github/workflows/ci.yml` (from `vars.` or
 `secrets.`) if CI deploys. A variable set only in GitHub has no effect on its
 own.
+
+## Valkey settings
+
+### Deploy-time variables
+
+Kamal reads these on the machine that runs it, when it renders
+`config/deploy.yml`. **All of them are optional**: unset or blank, each takes
+the default below, which is what a deploy that sets none of them gets. The app
+itself never reads them; it reads the runtime variables `REDIS_URL`,
+`REDIS_CACHE_URL` and `REDIS_CABLE_URL` (README, ["Valkey or Redis"](../README.md#valkey-or-redis)),
+which `deploy.yml` sets for it.
+
+| Variable | Required | Default | What it does | Notes |
+|---|---|---|---|---|
+| `KAMAL_VALKEY_IMAGE` | optional | `valkey/valkey:9.1.3` | Image for all three accessories. | Pin an exact tag. Valkey 7.2+ or Redis 7.0+ works with Sidekiq. The command starts with flags, so a Redis image (`redis:8.2.1`) runs `redis-server` instead; use `redis-cli` wherever these docs say `valkey-cli`. |
+| `KAMAL_VALKEY_JOBS_MAXMEMORY` | optional | `256mb` | `--maxmemory` for `valkey-jobs` (Sidekiq). | About two thirds of the memory limit (see [Sizing](#sizing)). |
+| `KAMAL_VALKEY_JOBS_POLICY` | optional | `noeviction` | `--maxmemory-policy` for `valkey-jobs`. | **Keep `noeviction`.** Any other policy lets a full server silently drop queued jobs, retries and the cron schedule. |
+| `KAMAL_VALKEY_JOBS_MEMORY_LIMIT` | optional | `384m` | Docker `--memory` for `valkey-jobs`. | About 1.5 × maxmemory: room for fragmentation and the AOF rewrite fork. |
+| `KAMAL_VALKEY_JOBS_ARGS` | optional | none | Extra server arguments for `valkey-jobs`, appended last. | See "Extra arguments" below. Persistence is the append-only file only (`--appendonly yes --save ""`); keep the AOF on. |
+| `KAMAL_VALKEY_CACHE_MAXMEMORY` | optional | `128mb` | `--maxmemory` for `valkey-cache` (Rails cache). | The cache fills up to it, then evicts. |
+| `KAMAL_VALKEY_CACHE_POLICY` | optional | `allkeys-lru` | `--maxmemory-policy` for `valkey-cache`. | Keep an evicting policy (`allkeys-lru`, or `allkeys-lfu`). With `noeviction` a full cache refuses writes; the errors are swallowed, so caching quietly stops and the ingest rate limits fail open. |
+| `KAMAL_VALKEY_CACHE_MEMORY_LIMIT` | optional | `160m` | Docker `--memory` for `valkey-cache`. | About 1.25 × maxmemory (no fork). |
+| `KAMAL_VALKEY_CACHE_ARGS` | optional | none | Extra arguments for `valkey-cache`. | Persistence is off (`--save "" --appendonly no`) and should stay off: the cache is disposable. |
+| `KAMAL_VALKEY_CABLE_MAXMEMORY` | optional | `32mb` | `--maxmemory` for `valkey-cable` (Action Cable). | Pub/sub stores no keys, so it stays small. |
+| `KAMAL_VALKEY_CABLE_POLICY` | optional | `noeviction` | `--maxmemory-policy` for `valkey-cable`. | Nothing to evict either way. |
+| `KAMAL_VALKEY_CABLE_MEMORY_LIMIT` | optional | `64m` | Docker `--memory` for `valkey-cable`. | A floor for the process itself and subscriber buffers. |
+| `KAMAL_VALKEY_CABLE_ARGS` | optional | none | Extra arguments for `valkey-cable`. | Persistence is off and should stay off. |
+| `KAMAL_VALKEY_JOBS_EXTERNAL` | optional | unset | `1` sends the app's `REDIS_URL` to the server in `KAMAL_VALKEY_JOBS_URL` instead of `valkey-jobs`. | Not a secret. Any value other than `1` or blank stops the deploy. |
+| `KAMAL_VALKEY_CACHE_EXTERNAL` | optional | unset | The same for `REDIS_CACHE_URL` and `valkey-cache`. | |
+| `KAMAL_VALKEY_CABLE_EXTERNAL` | optional | unset | The same for `REDIS_CABLE_URL` and `valkey-cable`. | |
+| `KAMAL_VALKEY_JOBS_URL` | with `KAMAL_VALKEY_JOBS_EXTERNAL=1`, **secret** | none (the app gets `redis://goodsorcery_web-valkey-jobs:6379/0`) | The external server's URL, read through `.kamal/secrets`. | Passed to the app as a secret, never in `env.clear`. That server must be `noeviction` with persistence on. |
+| `KAMAL_VALKEY_CACHE_URL` | with `KAMAL_VALKEY_CACHE_EXTERNAL=1`, **secret** | none (`redis://goodsorcery_web-valkey-cache:6379/0`) | The same for the cache. | Never point it at the jobs server's database (see the README). |
+| `KAMAL_VALKEY_CABLE_URL` | with `KAMAL_VALKEY_CABLE_EXTERNAL=1`, **secret** | none (`redis://goodsorcery_web-valkey-cable:6379/0`) | The same for Action Cable. | |
+
+The names follow `deploy.yml`'s existing `KAMAL_*` variables (read by Kamal,
+not the app). The URL variables deliberately aren't called `REDIS_URL` and so
+on: a `REDIS_URL` left in your shell for local work would otherwise silently
+repoint production.
+
+**Keep your overrides in one file and load it before every Kamal command.**
+`deploy.yml` reads these variables each time Kamal runs, and an unset one
+silently means the default. Put every `KAMAL_VALKEY_*` value you change, the
+`_EXTERNAL` flags included, in a git-ignored file (`.env.kamal` in the
+checkout: `.gitignore` already ignores `.env*`), with `export` on each line,
+and `source .env.kamal` in the shell before any `bin/kamal` command. Mirror
+the flags in CI (below). The risk is real: a later
+`bin/kamal accessory reboot valkey-jobs` from a shell without the file
+recreates the instance with the defaults. If you had raised its sizes, the
+data in its append-only file may no longer fit: above the default memory
+limit, the container is OOM-killed while loading the file and restarts over
+and over; above the default maxmemory alone, Valkey starts but refuses every
+write. Either way Sidekiq can't enqueue anything. `bin/kamal config` shows
+what the current shell would deploy.
+
+**Sizing settings only apply when an accessory boots.** CI boots a Valkey
+accessory only when it is missing (with any `KAMAL_VALKEY_*` sizing variables
+set in the GitHub `production` environment), so after changing one, source
+your file on your laptop and run
+`bin/kamal accessory reboot valkey-cache` (or the instance you changed).
+Rebooting `valkey-jobs` keeps its data; rebooting the others empties them,
+which is harmless. The `_EXTERNAL` flags and the URLs are the exception: they
+change the app's environment, so CI needs them on every deploy (below).
+
+**Extra arguments** (`KAMAL_VALKEY_<ROLE>_ARGS`) go through the server's shell
+as written, after the default flags, so a later flag wins (for example
+`--io-threads 2`, or `--maxmemory-clients 16mb`). Quote values the shell would
+split or expand; an unquoted `#` starts a shell comment and drops the rest.
+Don't put a password here (`--requirepass ...`): it shows in Kamal's own
+output (`bin/kamal accessory boot` and `reboot`, `bin/kamal config`) and in the `docker run` command line, which anyone with Docker
+access on the server can read. To protect an in-cluster instance with a
+password, keep `requirepass` in a config file mounted with the accessory's
+`files:` option (a local change to `deploy.yml`; the file must be readable by
+the container's `valkey` user), load it with `--include /path/in/container`
+in the ARGS, and give the app the matching URL as the role's secret
+(`redis://:PASSWORD@goodsorcery_web-valkey-jobs:6379/0`, with
+`KAMAL_VALKEY_JOBS_EXTERNAL=1`, since the default URLs carry no password). Or
+use an external server, below. On the private `kamal` network, unreachable
+from outside the server, the defaults run without a password.
+
+### Using an external or managed server
+
+To run a role on a managed Valkey or Redis (or any server outside Kamal):
+
+1. Set `KAMAL_VALKEY_<ROLE>_EXTERNAL=1` (for example
+   `KAMAL_VALKEY_CACHE_EXTERNAL=1`) in your overrides file, and for CI deploys
+   as a variable in the GitHub `production` environment.
+2. Provide the URL as the `KAMAL_VALKEY_<ROLE>_URL` secret. `.kamal/secrets`
+   reads all three from the environment, like the other secrets, or change
+   that line to fetch it through a secrets adapter (1Password and so on; see
+   the file's header). For CI deploys, add it as a secret in the GitHub
+   `production` environment; `.github/workflows/ci.yml` already passes the
+   flags and URLs to Kamal.
+3. With the flag set, `deploy.yml` drops that role's in-cluster URL from
+   `env.clear` and hands the app the secret instead (for example
+   `REDIS_CACHE_URL` from `KAMAL_VALKEY_CACHE_URL`), and the pre-deploy check
+   stops a deploy whose URL is empty. A URL set in the shell without the flag
+   stops Kamal with an error instead of being ignored, since ignoring it would
+   point the app at the in-cluster accessory without a word.
+4. **Don't boot that role's accessory.** Boot the others by name instead of
+   `bin/kamal accessory boot all` (which boots every accessory in the file), for
+   example `bin/kamal accessory boot valkey-jobs` and
+   `bin/kamal accessory boot valkey-cable`. If one was already booted, remove
+   it with `bin/kamal accessory remove valkey-cache`. An unused accessory left
+   running does no harm beyond its memory. (`bin/kamal setup` boots every
+   accessory; remove the unused one afterwards.)
+
+### The pre-deploy check
+
+`.kamal/hooks/pre-deploy` runs on the machine that deploys (your laptop, or
+CI) after the image is built and before any container changes. For each role
+without `KAMAL_VALKEY_<ROLE>_EXTERNAL=1`, it checks over SSH (as
+`KAMAL_SSH_USER` on `KAMAL_SSH_PORT`, like Kamal) that
+`goodsorcery_web-valkey-<role>` is running on every host in the deploy; for an
+external role, that its URL secret isn't empty. If anything is missing it
+stops the deploy, so the old containers keep serving. Without it, a web
+container would pass its health check (`/up` doesn't touch Valkey) and take
+traffic while ingest failed to enqueue and Sidekiq crash-looped. It skips the
+container check under `bin/kamal setup`, which boots the accessories after the
+hook runs. The SSH call needs the server's host key in `~/.ssh/known_hosts`
+(CI already has it); `--skip-hooks` bypasses the check if you must.
+
+### Sizing
+
+The defaults fit a 4 GB server that also runs Postgres, Puma, Sidekiq,
+kamal-proxy and cloudflared: about 608 MB of container limits for Valkey in
+total (384 + 160 + 64), most of it for jobs. `maxmemory` caps the data;
+the container limit must also hold what maxmemory doesn't count, and a
+container over its limit is OOM-killed and restarted:
+
+- **Jobs (limit about 1.5 × maxmemory):** allocator fragmentation (often
+  10–30%) plus the AOF rewrite. The rewrite forks a child in the same
+  container, and every page the parent changes while the child runs is copied,
+  so under heavy writes the copy can approach the dataset's size. RDB
+  snapshots are off (`--save ""`), so the rewrite is the only fork (it runs
+  when the file doubles, from 64 MB). The extra half is headroom for an
+  instance running well below maxmemory, not a guarantee for a full one being
+  rewritten under load: watch `used_memory_rss` and the logs for OOM restarts.
+  A healthy queue is small; memory grows with backlog (an outage of Sidekiq,
+  or a flood of ingest) and with the retry and dead sets. On 8 GB or more,
+  512mb–1gb (limit 1.5 × that) buys more headroom for backlogs. Below 256mb,
+  watch `used_memory` during bursts: a full `noeviction` server refuses new
+  jobs. The ingest counter buffer shares this instance: its pending counts
+  are one small hash field per issue, hour and tag value touched in the last
+  10 seconds, plus a guard key of about 100 bytes per event for 2 minutes
+  (roughly 12 MB at a sustained 1,000 events a second). When the server is
+  full, events write their counts straight to Postgres instead.
+- **Cache (limit about 1.25 × maxmemory):** nothing is persisted, so nothing
+  forks; the margin covers fragmentation from eviction churn. If it is ever
+  exceeded, the restart only costs a cold cache. More memory means fewer
+  evictions of fragments, counts and key lookups. 256mb–512mb suits 8 GB; on a
+  2 GB server, 64mb is a reasonable floor.
+- **Cable (limit 64m):** no data and no fork, so the limit is a floor for the
+  process (about 10 MB) and its subscribers' output buffers rather than a
+  multiple. Action Cable keeps one subscriber connection per web process, not
+  per browser, and messages are tiny pointers, so 32mb rarely needs changing.
+  On a 2 GB server, give the memory you save to Postgres instead.
+
+Raise `MAXMEMORY` and `MEMORY_LIMIT` together, keeping these ratios, put both
+in your overrides file, then reboot the accessory. `valkey-cli info memory`
+(see "Day to day") shows how close each instance runs to its limit
+(`used_memory_rss_human` is what counts against the container limit).
 
 ## Deploying from a fork
 
@@ -278,19 +501,125 @@ so forks run the checks but never try to deploy. To deploy your fork from CI:
 
 ## Accessories are managed by hand
 
-CI only deploys the app. Postgres, Redis and cloudflared keep running across
+CI only deploys the app. Postgres, Valkey and cloudflared keep running across
 deploys, and **merging a change to an accessory in `deploy.yml` (such as a new
-image version) does not apply it**. Run the change from your laptop:
+image version, or a new accessory) does not apply it**. Run the change from
+your laptop; for a new accessory the app depends on, boot it before the merge.
+The one exception is a *missing or stopped* Valkey accessory: CI's deploy job
+runs `bin/boot_valkey_accessories` first, which boots or starts it (it never
+reboots a running one, so a new image or size still needs the commands below):
 
 | Situation | Command | Needs |
 |---|---|---|
 | Restart (stuck, or after a server reboot) | `bin/kamal accessory restart tunnel` | `KAMAL_WEB_HOST`, `KAMAL_SSH_PORT`, `GOODSORCERY_HOST` |
 | New image version or rotated secret | `bin/kamal accessory reboot tunnel` | the above, every secret in `.kamal/secrets` the accessory uses, and the registry login from "First boot" |
+| New accessory | `bin/kamal accessory boot valkey-cache` | the above |
+
+Rebooting `valkey-cache` or `valkey-cable` loses nothing that matters (a cold
+cache, a moment of missed live updates). Rebooting `valkey-jobs` stops Sidekiq
+from reaching it for a few seconds; its data survives in the data directory.
+Source your `KAMAL_VALKEY_*` overrides file first, or the reboot uses the
+default sizes ([Valkey settings](#valkey-settings)). A deploy while a Valkey
+accessory is missing or stopped is refused by
+[the pre-deploy check](#the-pre-deploy-check).
 
 `reboot` recreates the container and re-uploads its env file from your shell.
 For the tunnel, export `CLOUDFLARE_TUNNEL_TOKEN` first: an empty value takes
 the tunnel, and the site, down. The token deliberately isn't stored in GitHub,
 since anyone holding it can run a connector for your hostname.
+
+## Moving from one Redis to three Valkey instances
+
+Deployments set up before the switch run one `redis` accessory
+(`goodsorcery_web-redis`) shared by Sidekiq, the cache and Action Cable. The
+move starts Sidekiq on an empty Valkey; nothing is copied over, because data
+files from Redis 7.4 and later may not load in Valkey. Ingest loses nothing:
+every accepted event is in Postgres (`inbound_events`) and
+`goodsorcery:requeue_stale` (every 10 minutes) re-enqueues any that never got
+processed. **Retries, scheduled jobs and dead jobs in the old Redis are
+dropped**, along with any other job still queued there at the switch (an alert
+email or Slack post, a performance batch, an uptime check). The sidekiq-cron
+schedule is reloaded from `config/schedule.yml` when Sidekiq boots.
+
+Do it in this order:
+
+1. **Prepare the host.** As root, set `vm.overcommit_memory = 1` and add a
+   1–2 GB swap file, as in [1. Server](#1-server). Neither is managed by
+   Kamal. Check with `sysctl vm.overcommit_memory` and `swapon --show`.
+
+2. **Boot the new accessories.** **If you deploy through the GitHub
+   workflow, skip this step:** its deploy job runs `bin/boot_valkey_accessories`
+   before `bin/kamal deploy`, which boots each Valkey accessory that isn't on
+   the server yet (with the default sizes, or the `KAMAL_VALKEY_*` variables
+   set in the `production` environment) and leaves running ones alone.
+   Deploying from your laptop, boot them yourself first. Without the
+   accessories, the new web containers would pass their health
+   check and take traffic while ingest failed to enqueue and Sidekiq
+   crash-looped, so [the pre-deploy check](#the-pre-deploy-check) stops such a
+   deploy before any container changes. From a
+   checkout that has the change (an up-to-date `main`), with the variables from
+   [6. First boot](#6-first-boot) exported and your `KAMAL_VALKEY_*` overrides
+   file sourced, if you have one ([Valkey settings](#valkey-settings); leave
+   out an accessory whose role you point at an external server):
+
+   ```sh
+   bin/kamal accessory boot valkey-jobs
+   bin/kamal accessory boot valkey-cache
+   bin/kamal accessory boot valkey-cable
+   bin/kamal accessory exec valkey-jobs --reuse "valkey-cli ping"   # PONG (likewise the other two)
+   ```
+
+   The old app keeps using Redis meanwhile; the new instances sit idle. If a
+   role goes to an external server instead, set its
+   `KAMAL_VALKEY_<ROLE>_EXTERNAL=1` flag and `KAMAL_VALKEY_<ROLE>_URL` secret
+   now (in the GitHub `production` environment, and in your overrides file and
+   `.kamal/secrets` locally), so the deploy picks them up.
+
+3. **Deploy** (in the upstream repository, merging deploys through CI; on your
+   own install, push or re-run your CI deploy, or run `bin/kamal deploy`).
+   Expect:
+   - A cold cache. Rate-limit windows start again, and each API key is looked
+     up in Postgres once before it is cached again.
+   - A few seconds of missed live-update broadcasts while old containers
+     (publishing to Redis) and new ones (publishing to Valkey) run side by
+     side. Open pages catch up on their next update or reload.
+   - Don't rotate API keys during the deploy. A rotation on an old container
+     clears the old cache only, so the new cache can keep accepting the old
+     key for up to 5 minutes.
+   - If the release you are leaving already buffered ingest counters in the
+     old Redis (docs/ARCHITECTURE.md §2.5.2), the counts still pending there
+     at the switch, about 10 seconds' worth, are not carried over, so issue
+     and app counts end up that much low. Upgrading to the buffer and the
+     three instances in one deploy loses nothing.
+
+4. **Verify.** `bin/kamal logs -r job` should show Sidekiq starting without
+   connection errors, and new events should appear in the dashboard. Events
+   stranded in the old Redis count as stale once they are 10 minutes old, so
+   let the 10-minute cron re-enqueue them, or run
+   `bin/kamal app exec -r web "bin/rails goodsorcery:requeue_stale"` 10 or more
+   minutes after the deploy (earlier, it finds nothing). Then check each
+   instance's memory:
+   `bin/kamal accessory exec valkey-jobs --reuse "valkey-cli info memory"`
+   (and `valkey-cache`, `valkey-cable`).
+
+5. **Remove the old Redis.** It is no longer in `deploy.yml`, so
+   `bin/kamal accessory remove redis` from an up-to-date checkout can't find
+   it. Over SSH as the deploy user:
+
+   ```sh
+   docker stop goodsorcery_web-redis
+   docker rm goodsorcery_web-redis
+   docker image rm redis:8
+   # Kamal kept its data in ~/goodsorcery_web-redis (the SSH user's home). The
+   # container chowned it to its own user, so delete it from a container:
+   docker run --rm -v "$HOME:/deploy-home" valkey/valkey:9.1.3 rm -rf /deploy-home/goodsorcery_web-redis
+   ```
+
+   Alternatively, run `bin/kamal accessory remove redis` from a checkout of
+   the commit before the switch (for example `git worktree add ../before-valkey MERGE_COMMIT^1`),
+   which removes the container and the image; if it then stops at the data
+   directory with "Permission denied", delete that with the last command
+   above. Either way the retries and dead jobs left in it are gone for good.
 
 ## Backups
 

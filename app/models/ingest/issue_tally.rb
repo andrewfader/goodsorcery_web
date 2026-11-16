@@ -1,5 +1,17 @@
-# Finds or race-safely creates the issue for an event, and applies the event to
-# the issue's counters in one locking UPDATE (ARCHITECTURE.md §2.5).
+# Finds or race-safely creates the issue for an event, decides whether the
+# event can change the issue's state, and if so applies it to the issue in
+# one locking UPDATE (ARCHITECTURE.md §2.5).
+#
+# Fast and slow path: the plain SELECT that finds the issue also reads the
+# columns a transition depends on (#snapshot). An event that can't change
+# them (#settled?) skips the locking UPDATE; its counters go to the counter
+# buffer instead (Ingest::CounterBuffer). Everything else (a new issue, a
+# regression, a new environment, reaching production, an event older than
+# first_seen_at) takes the slow path through COUNT_SQL, as before.
+#
+# The snapshot is read before the event's transaction, so a user may resolve
+# the issue in between. A fast-path event then counts as if it had been
+# processed just before the resolve: it neither reopens the issue nor alerts.
 #
 # The issue row is locked FOR NO KEY UPDATE: that still serialises counter
 # updates, but unlike FOR UPDATE it does not conflict with the FOR KEY SHARE
@@ -38,7 +50,15 @@ class Ingest::IssueTally
       (previous.reached_production_at IS NULL AND issues.reached_production_at IS NOT NULL) AS just_reached_production
   SQL
 
-  attr_reader :issue_id
+  # What the plain SELECT reads: enough to decide #settled? and to stand in
+  # for the issue on the fast path (announce and alert flagging read only
+  # these), with no transition to report.
+  SNAPSHOT_COLUMNS = [
+    "issues.id", "issues.project_id", "issues.status", "issues.environments", "issues.first_seen_at",
+    "issues.reached_production_at", "issues.status AS previous_status", "false AS just_reached_production"
+  ].freeze
+
+  attr_reader :issue_id, :snapshot
 
   def initialize(project, event)
     @project, @event = project, event
@@ -51,7 +71,7 @@ class Ingest::IssueTally
   # reserves its number in a short statement of its own, so the projects row
   # is not locked for the whole transaction.
   def prepare
-    @issue_id = existing_issue_id
+    @issue_id = find_snapshot
     @number = @project.allocate_issue_number unless @issue_id
     self
   end
@@ -59,7 +79,18 @@ class Ingest::IssueTally
   # Plain SELECT first; only a miss inserts. Losing an insert race to a
   # concurrent processor falls back to the winner's id.
   def find_or_create_issue_id
-    @issue_id ||= existing_issue_id || create_issue_id || existing_issue_id
+    @issue_id ||= find_snapshot || create_issue_id || find_snapshot
+  end
+
+  # True when the event can't change the issue's state, so the fast path
+  # may count it without locking the issue row. Mirrors COUNT_SQL. Reaching
+  # production needs no check of its own: a production-like environment
+  # already in `environments` means the issue can't reach production again.
+  def settled?
+    return false if created? || snapshot.nil?
+
+    !snapshot.resolved? && snapshot.environments.include?(@event.environment) &&
+      @event.occurred_at >= snapshot.first_seen_at
   end
 
   # Applies the event to the issue row and returns the updated Issue, with the
@@ -76,8 +107,11 @@ class Ingest::IssueTally
         production: EnvironmentTone.production?(@event.environment), production_names: PRODUCTION_NAMES, now: Time.current }
     end
 
-    def existing_issue_id
-      Issue.uncached { Issue.where(project_id: @project.id, fingerprint: @event.fingerprint).pick(:id) }
+    # The issue's id, keeping the rest of the row in #snapshot.
+    def find_snapshot
+      @snapshot = Issue.uncached { Issue.where(project_id: @project.id, fingerprint: @event.fingerprint).select(SNAPSHOT_COLUMNS).take }
+      @snapshot.association(:project).target = @project if @snapshot
+      @snapshot&.id
     end
 
     def create_issue_id

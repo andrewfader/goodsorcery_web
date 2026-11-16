@@ -4,7 +4,7 @@ Design notes for contributors. This document describes how Good Sorcery is put t
 
 Read the sections for the area you are changing before you change it, especially the ground rules (§0), encryption (§1.4), the ingest pipeline (§2), authorization (§6) and the security checklist (§9). `docs/INGEST_API.md` is the public payload spec for client authors, and `CLAUDE.md` / `CONTRIBUTING.md` hold the day-to-day conventions.
 
-Stack: Ruby 4.0.7, Rails 8.1.4, Postgres (pg_trgm), Propshaft, importmap, Turbo, Stimulus, tailwindcss-rails 4 (Tailwind v4), Sidekiq and Redis in production, async adapters in development. There are no Solid gems.
+Stack: Ruby 4.0.7, Rails 8.1.4, Postgres (pg_trgm), Propshaft, importmap, Turbo, Stimulus, tailwindcss-rails 4 (Tailwind v4), Sidekiq, the Redis cache store and Action Cable's Redis adapter in production (any Redis-compatible server; the Kamal deploy runs one Valkey each for jobs, cache and cable via `REDIS_URL`, `REDIS_CACHE_URL` and `REDIS_CABLE_URL`), async adapters in development. There are no Solid gems.
 
 ---
 
@@ -54,7 +54,7 @@ Account ─┬─< Membership >── User ──< Session (session.account = cu
 
 ### 1.3 Tables
 
-The uptime build (§12.1) adds `accounts.entitlement_values`, the `uptime_monitors`, `uptime_checks`, `uptime_hourly_counts` and `uptime_incidents` tables, and `notification_preferences.uptime_alerts_muted`. The APM build (§13.2) adds the `apm_transactions`, `apm_minute_stats`, `apm_hourly_stats`, `apm_traces` and `apm_inbound_batches` tables. The MCP build (§14.1) adds `personal_access_tokens`, `access_token_activities` and `issue_activities.via`.
+The uptime build (§12.1) adds `accounts.entitlement_values`, the `uptime_monitors`, `uptime_checks`, `uptime_hourly_counts` and `uptime_incidents` tables, and `notification_preferences.uptime_alerts_muted`. The APM build (§13.2) adds the `apm_transactions`, `apm_minute_stats`, `apm_hourly_stats`, `apm_traces` and `apm_inbound_batches` tables. The MCP build (§14.1) adds `personal_access_tokens`, `access_token_activities` and `issue_activities.via`. The counter buffer (§2.5.2) adds `counter_flushes`.
 
 All `id`s are `bigint`. FKs are real `add_foreign_key` constraints. "cascade" means `on_delete: :cascade`.
 
@@ -138,6 +138,13 @@ Token format: `gs_live_` + `SecureRandom.base58(32)` when `environment == "produ
 | body | text | false | **encrypted** raw JSON (compressed by AR encryption) |
 | received_at | datetime | false | |
 Indexes: `[received_at]` (stale requeue). No `updated_at`.
+
+**counter_flushes** (ledger of applied counter chunks, §2.5.2; ids only)
+| column | type | null | notes |
+|---|---|---|---|
+| id | uuid (primary key) | false | the chunk's id, `uuid_v5` of the batch id and chunk index |
+| created_at | datetime | false | |
+Indexes: `[created_at]` (pruning after `CounterFlush::KEPT_FOR`). No `updated_at`.
 
 **issues**
 | column | type | null | default | notes |
@@ -311,7 +318,7 @@ Associations use `inverse_of`, so `@project.issues` sets `issue.project` without
   - `#masked_token` returns `"#{token_prefix}••••••••••••#{token_last4}"`.
   - `.record_usage(id)` updates `last_used_at` (`update_all`) at most once per minute per key, gated by `Rails.cache.write(["api_key_used", id], 1, unless_exist: true, expires_in: 1.minute)`.
   - `#default?`.
-- **InboundEvent**: `belongs_to :project, :api_key`; `encrypts :body`; `scope :stale, -> { where(received_at: ...10.minutes.ago) }`.
+- **InboundEvent**: `belongs_to :project, :api_key`; `encrypts :body`; `STALE_AFTER = 10.minutes`; `scope :stale, ->(after = STALE_AFTER) { where(received_at: ...after.ago) }` (§2.7).
 - **Issue**:
   - `belongs_to :project` (inverse), `belongs_to :assignee, class_name: "User", optional: true`; `has_many :occurrences, :hourly_counts, :tag_counts, :issue_users, :activities`.
   - `enum :status` and `enum :level` (string-backed, `validate: true`).
@@ -367,12 +374,13 @@ The two ingest controllers include the `IngestEndpoint` concern, which holds eve
 - **Auth:** `Authorization: Bearer <api key>` (`ApiKeyAuthentication`). Any other scheme or a missing header returns 401.
 - **Content-Type:** must be `application/json` (415 otherwise). `Content-Encoding: gzip` is supported.
 - **Size cap:** 512 KiB (2 MiB for a batch) for both the compressed and the decompressed body. `Ingest::RequestBody#read` (`max:`) rejects early when `Content-Length` > cap and reads gzip with `Zlib::GzipReader#read(cap + 1)` to defend against zip bombs. Oversized bodies return 413.
-- **Rate limits** (store = `Ingest::RateLimitStore`, i.e. `Rails.cache`, so Redis in production; fixed one-minute windows):
+- **Rate limits** (store = `Ingest::RateLimitStore`, i.e. `Rails.cache`, so the cache's Valkey/Redis in production; fixed one-minute windows):
   1. `rate_limit to: 6_000, within: 1.minute, by: -> { request.remote_ip }, name: "ip", scope: "api/v1/events"` (Rails 8 `rate_limit`, declared first; it counts requests and the scope makes the counter shared by both ingest endpoints)
   2. `before_action :authenticate_api_key`
-  3. `before_action :limit_event_rate`: `Ingest::EventRateLimit` takes events from two `Ingest::RateCounter`s, per key (1,200/min) and per account (6,000/min), with the keys `rate-limit:api/v1/events:key:<id>` and `…:account:<id>`. Rails' `rate_limit` can only add 1, so these counters `increment` by N (`expires_in` = window). Admission is all or nothing; a rejected amount is given back. Both endpoints take 1 here (`IngestEndpoint#limit_event_rate`), so every request that reaches the body costs at least one unit. The batch endpoint takes the other N − 1 in `#create` once the body is parsed and the `events` array checked; if they don't fit it gives the first unit back too, so a 429 uses up nothing.
+  3. `before_action :shed_when_backlogged` (§2.1.3; 429 `server_busy` with `Retry-After: 30`, not a rate limit)
+  4. `before_action :limit_event_rate`: `Ingest::EventRateLimit` takes events from two `Ingest::RateCounter`s, per key (1,200/min) and per account (6,000/min), with the keys `rate-limit:api/v1/events:key:<id>` and `…:account:<id>`. Rails' `rate_limit` can only add 1, so these counters `increment` by N (`expires_in` = window). Admission is all or nothing; a rejected amount is given back. Both endpoints take 1 here (`IngestEndpoint#limit_event_rate`), so every request that reaches the body costs at least one unit. The batch endpoint takes the other N − 1 in `#create` once the body is parsed and the `events` array checked; if they don't fit it gives the first unit back too, so a 429 uses up nothing.
   All return 429 with `Retry-After: 60` and `{"error":"rate_limited"}` (`render_rate_limited`).
-- **Check order:** per-IP limit, key (401), key/account limits (one unit), quota (429 `quota_exceeded`), media type (415), body size (413), JSON (400), shape (422), then for a batch the remaining event-weighted key/account units (429) and per-event validation.
+- **Check order:** per-IP limit, key (401), ingest backlog (429 `server_busy`, §2.1.3), key/account limits (one unit), quota (429 `quota_exceeded`), media type (415), body size (413), JSON (400), shape (422), then for a batch the remaining event-weighted key/account units (429) and per-event validation.
 - **Responses:**
   - `202 {"id":"<event uuid>"}`
   - `400 {"error":"invalid_json"}`
@@ -380,7 +388,7 @@ The two ingest controllers include the `IngestEndpoint` concern, which holds eve
   - `413 {"error":"payload_too_large"}`
   - `415 {"error":"unsupported_media_type"}`
   - `422 {"error":"invalid_payload","messages":[…]}`
-  - `429`
+  - `429 {"error":"rate_limited"}`, `{"error":"quota_exceeded"}` or `{"error":"server_busy"}` (§2.1.3)
 
   Error messages never echo payload content.
 
@@ -391,6 +399,20 @@ The two ingest controllers include the `IngestEndpoint` concern, which holds eve
 #### 2.1.2 Verify endpoint
 
 `GET /api/v1/verify` authenticates the key and returns `200 {"ok":true,"environment":"<key env>"}`. It creates nothing and uses its own Rails `rate_limit` counters (6,000/min per IP, 60/min per key, scope `api/v1/verifications`), so it never touches the ingest allowances or the quota.
+
+#### 2.1.3 Backlog shedding (`Ingest::Backlog`)
+
+When Sidekiq falls behind (an incident upstream sends a flood), accepted events would pile up in `inbound_events` and be deleted unprocessed after a day (`Ingest::Retention::UNPROCESSED_TTL`). Instead, both event endpoints answer `429 {"error":"server_busy"}` with `Retry-After: 30` and store nothing while the ingest queue is too far behind.
+
+- **Signal:** the age of the oldest job waiting in Sidekiq's `ingest` queue (`Ingest::QueueLatency` → `Sidekiq::Queue#latency`, one `LINDEX`). Not Postgres: `min(received_at)` over `inbound_events` would be stuck at hours by poison rows (re-enqueued every 10 minutes until the 1-day TTL) and could be slow on a bloated index. The retry and dead sets don't count. Outside the Sidekiq adapter (development and test) it reads 0, so nothing is shed.
+- **Hysteresis, per process:** shedding starts once the latency is ≥ `config.x.ingest.shed_after_seconds` (120) and stops once it is below `config.x.ingest.resume_below_seconds` (30), both read once at boot from `GOODSORCERY_INGEST_SHED_AFTER_SECONDS` / `GOODSORCERY_INGEST_RESUME_BELOW_SECONDS` (`IngestShedding`: whole numbers; a shed-after of `0` turns shedding off; an unset resume value is 30 or half of shed-after, whichever is less, so setting only `SHED_AFTER=20` gives 20/10; an explicit resume value must be between 1 and shed − 1, and shed-after can't be 1; anything invalid falls back to both defaults with a warning on stderr). Same self-hosted and hosted.
+- **Never queues requests:** `Ingest::Backlog.current` is one instance per process. It reads the latency at most every 5 seconds (`REFRESH_INTERVAL`), only in the thread that wins a `Mutex#try_lock` (the others use the last value without waiting), through its own one-connection Redis pool with no reconnect attempt. redis-client gives each step its own budget: DNS, the TCP connect and each TLS handshake wait 0.5 s (`CONNECT_TIMEOUT`), every reply 1 s (`READ_TIMEOUT`). A stall at one step costs that step: about 1 s on an open connection and 1–1.5 s while connecting, for one request per process at most every 5 s. Only a Redis slow at every step without failing any adds them up, to about 3.5 s. The read is 1 s (redis-client's default), not shorter: a waiting thread doesn't hold the GVL, so a busy Puma delays its wake-up but can't turn a timely reply into a timeout, while Redis itself can slow down under an incident's enqueue load, and a read that kept failing would let the sample pass `MAX_AGE` and admit exactly when shedding matters. The same request then enqueues through Sidekiq's pool (3 s timeout) anyway. A failed read keeps the last value (logged by error class at most once a minute); a value older than 60 s (`MAX_AGE`) is unknown, and unknown admits (fail open: with Redis down the enqueue fails anyway). Samples are immutable `Data` values, so Puma threads read them safely.
+- **Position:** after the key check (bad keys still get 401) and before the event limits take a unit, the quota and the body, so a shed request costs no allowance and reads nothing. The per-IP `rate_limit` still counts it. `GET /api/v1/verify` and the APM endpoints don't shed.
+- **Redis:** it connects where Sidekiq connects, `config.x.ingest.queue_redis_options`, built once at boot in `config/application.rb` (the variable named by `REDIS_PROVIDER`, else `REDIS_URL`, as `Sidekiq::RedisConnection` resolves it; there is no Sidekiq initializer). A future Sidekiq initializer that sets `config.redis` (TLS, a password) must set these options too, or every read fails and ingest never sheds.
+- **Sidekiq stopped (accepted trade-off):** shedding doesn't tell a slow Sidekiq from a stopped one. If Sidekiq is down, or no process takes the `ingest` queue, while Redis is up, jobs keep waiting, the latency passes 120 s about two minutes later, and from then on every client gets `429 server_busy` until Sidekiq is back and the queue drains below 30 s. Before shedding, ingest kept answering 202 and buffered events in Postgres for up to a day (`UNPROCESSED_TTL`). Now the clients hold them instead: each keeps at most about 1,000 events in memory and drops the rest, and loses what it holds if its process exits. Events accepted in the first two minutes are still processed once Sidekiq is back. Chosen on purpose: the server never builds up a backlog it can't work through, and the cause is a dead worker, which monitoring should catch.
+- **Retry-After 30:** both clients (Ruby gem, Rust crate) pause their single delivery worker for exactly `Retry-After` (clamped to 1 s–1 h) on any 429, without spending a retry, and keep queueing up to 1,000 events, so a long value only makes them drop events locally. Not 503: clients retry 5xx only three times and then drop the batch.
+- **Logging:** `started shedding events` (warn) and `stopped shedding events` (info), with the latency and thresholds only. Between a stop and the next start the oldest job has to age from under 30 s to 120 s, so the lines can't flood.
+- **Requeue:** `Ingest::StaleEvents` (§2.7) reads the same latency to avoid requeueing jobs that are still waiting, its own requeued jobs included.
 
 ### 2.2 Keeping PII out of Redis, Sidekiq and logs
 
@@ -409,6 +431,7 @@ The two ingest controllers include the `IngestEndpoint` concern, which holds eve
    ```
    In `config/application.rb`: `config.autoload_lib(ignore: %w[assets tasks middleware])`, `require_relative "../lib/middleware/ingest_body_shield"` and `config.middleware.use IngestBodyShield`. (Rack middleware must define `call`; this is the one sanctioned exception to the no-`call` rule.)
 4. **Exceptions:** never interpolate payload content into exception messages, because Sidekiq stores error messages in Redis. `JSON::ParserError` is rescued and turned into a discard (§2.4) without its message.
+5. **Counter buffer keys** (§2.5.2, `Ingest::CounterFields`) may hold ids (issues, projects, occurrences), hour starts, environment names, tag keys and tag value digests, and numbers. Never a tag value, an identity or anything else captured. The digest is the `IssueTagCount.value_digest` HMAC (`PrivateDigest`, keyed from `secret_key_base`), the same one `issue_tag_counts.value_digest` already stores in plaintext. Trade-off: a tag with few likely values (a browser name, a plan, a feature flag) could be guessed from its digest by someone who holds both the Valkey data and the `secret_key_base`-derived key. Without that key a digest reveals nothing, and Valkey is never exposed outside the private network. `test/models/ingest/counter_buffer_test.rb` asserts that digests appear in the store and values never do.
 
 ### 2.3 Processing objects (`app/models/ingest/`)
 
@@ -420,6 +443,9 @@ The two ingest controllers include the `IngestEndpoint` concern, which holds eve
 | `Ingest::BatchItem` | one batch event, re-serialised | `#rejected?`, `#rejection`, `#acceptance`, `#event_uuid`, `#body` |
 | `Ingest::RateCounter` | weighted fixed-window counter in `Ingest::RateLimitStore` | `#take(amount)`, `#give_back(amount)` |
 | `Ingest::EventRateLimit` | per-key and per-account event allowances | `#admit?(events)`, `#give_back(events)` |
+| `Ingest::Backlog` | backlog-aware admission, one per process (§2.1.3) | `.current`, `#shedding?`, `#latency` → seconds or nil; `RETRY_AFTER` |
+| `Ingest::QueueLatency` | age of the oldest waiting `ingest` job (Sidekiq only, own bounded pool) | `#seconds` |
+| `Ingest::StaleEvents` | requeue of events whose job was lost (§2.7) | `#requeue` → count, `#stale_after` |
 | `Ingest::Limits` | constants (§3.4) | — |
 | `Ingest::Event` | normalised, scrubbed, truncated event (value object) | `.from_json(json, project:, environment:, received_at:)` (raises `Ingest::MalformedPayload`). Readers: `exception_class`, `message`, `redacted_message`, `frames`, `top_app_frame`, `culprit`, `transaction_name`, `level`, `occurred_at`, `release`, `user_identity`, `tags`, `runtime_label`, `fingerprint`, `request` (`Ingest::RequestSection`), `job` (`Ingest::JobSection#to_h`), `#to_payload_json` |
 | `Ingest::Frame` | backtrace frame value (`Data.define`) | `file`, `line`, `column`, `method_name`, `module_name`, `in_app?`, `package`, `location` |
@@ -429,8 +455,16 @@ The two ingest controllers include the `IngestEndpoint` concern, which holds eve
 | `Ingest::Fingerprint` | grouping | `#digest` |
 | `Ingest::UserIdentity` | HMACs | `#primary_digest`, `#digests`, `present?` |
 | `Ingest::Processor` | orchestration (§2.5) | `#process` |
-| `Ingest::IssueTally` | issue upsert and atomic counters | `#find_or_create_issue_id`, `#count(new_user:)` → `Issue` (from `find_by_sql … RETURNING`) |
-| `Ingest::Rollups` | hourly, project, tag and user upserts | `#increment` → `new_user?` |
+| `Ingest::IssueTally` | issue upsert, the fast/slow decision (§2.5.1) and the locking counter UPDATE | `#prepare`, `#find_or_create_issue_id`, `#settled?`, `#snapshot`, `#count(new_user:)` → `Issue` (from `find_by_sql … RETURNING`) |
+| `Ingest::Rollups` | tag and user upserts (with the buffer, new tag values only), the slow path's issue hour | `#increment_issue` → `new_user?`, `#buffered_tag_rows`, `#increment_issue_hour` |
+| `Ingest::TagRows` | the bounded tag rows of one event | `#to_a`, `#stored_rows`, `#new_rows` |
+| `Ingest::CounterTotals` | counters summed over events, written in lock order (§2.5.1) | `.for_event(...)`, `#add_event`, `#chunks(rows)`, `#apply` |
+| `Ingest::CounterFields` | the buffer hash's field encoding (ids, hours, environments, tag keys, tag value digests) | `.increments`, `.maxima`, `.decode` |
+| `Ingest::DirectCounters` | counters without a buffer: written in the transaction | `#buffered?` (false), `#add_event(...)` |
+| `Ingest::CounterBuffer` | the Valkey counter buffer and its flush (§2.5.2) | `.current`, `.configured`, `#buffered?` (true), `#add_event(occurrence_id:, ...)`, `#flush` |
+| `Ingest::CounterStoreBreaker` | skips the store for 5 s after a failure (per process and pool) | `#open?`, `#trip` |
+| `CounterFlush` | ledger of applied chunks, and the flush's single-flight lock | `.exclusively { }`, `.apply_once(chunk_id) { }` |
+| `FlushIngestCountersJob` | queue `counters`, every 10 seconds (sidekiq-cron) | `perform` → `Ingest::CounterBuffer.configured&.flush` |
 | `ProcessInboundEventJob` | queue `ingest` | `perform(inbound_event)` → `Ingest::Processor.new(inbound_event).process` |
 | `TrimOccurrencesJob` | keep newest 100 per issue | `perform(issue)` |
 | `CapStoredOccurrencesJob` | every 5 minutes (sidekiq-cron): hold each project to 3,000 stored occurrences | `perform` → `Ingest::OccurrenceCap.enforce_all` |
@@ -465,23 +499,34 @@ The two ingest controllers include the `IngestEndpoint` concern, which holds eve
 load inbound_event (job) + project (1 query)
 event = Ingest::Event.from_json(...)            # MalformedPayload → inbound_event.destroy; log id only; return
 issue = nil
-tally = Ingest::IssueTally.new(project, event).prepare   # SELECT id …; if none: allocate the number now, in its own statement
+tally = Ingest::IssueTally.new(project, event).prepare   # SELECT id, status, environments, first_seen_at, reached_production_at …
+                                                         # if none: allocate the number now, in its own statement
 ApplicationRecord.transaction do
   issue_id = tally.find_or_create_issue_id     # if none: INSERT … ON CONFLICT DO NOTHING RETURNING id; reselect on conflict
   Occurrence.insert(…, unique_by: %i[project_id uuid], returning: %i[id])  → empty result ⇒ duplicate ⇒ raise ActiveRecord::Rollback
-  rollups  = Ingest::Rollups.new(issue_id, project, event)
-  new_user = rollups.increment_issue           # issue hourly, tags (multi-row, sorted, bounded), issue_users
-  issue    = tally.count(new_user:)            # the ONLY lock on the issue row (FOR NO KEY UPDATE), held until commit
-  IssueActivity regressed row if issue.previous_status == "resolved"
-  IssueActivity reached_production row if issue.just_reached_production   # system rows, issue row still locked
-  project.record_first_event(...) if tally.created?   # writes only when something changes
-  inbound_event.destroy!
-  rollups.increment_project                    # project hourly: the hottest row, locked last
+  rollups  = Ingest::Rollups.new(issue_id, project, event, buffer_tags: counters.buffered?)
+  new_user = rollups.increment_issue           # tags (multi-row, sorted, bounded; with the buffer, new values only), issue_users
+  if tally.settled?                            # fast path (§2.5.1): no transition possible
+    inbound_event.delete
+    counters.add_event(project, env, occurred_at, received_at, occurrence_id, tag_rows, issue_id:, new_user:)
+                                               # issue counters + issue hour + project hour (+ stored tag values)
+    issue = tally.snapshot                     # the SELECTed row; reports no transition
+  else                                         # slow path
+    rollups.increment_issue_hour
+    issue = tally.count(new_user:)             # the ONLY lock on the issue row (FOR NO KEY UPDATE), held until commit
+    IssueActivity regressed row if issue.previous_status == "resolved"
+    IssueActivity reached_production row if issue.just_reached_production   # system rows, issue row still locked
+    project.record_first_event(...) if tally.created?   # writes only when something changes
+    inbound_event.delete
+    counters.add_event(project, env, occurred_at, received_at, occurrence_id, tag_rows)   # project hour (+ stored tag values)
+  end
 end
 after commit (only if issue): issue.broadcast_changes_later(created: tally.created?); project.broadcast_changes_later;
-                               TrimOccurrencesJob.perform_later(issue) if (issue.events_count % TRIM_EVERY).zero?  # TRIM_EVERY = 50
+                               TrimOccurrencesJob.perform_later(issue) if Random.rand(TRIM_EVERY).zero?  # TRIM_EVERY = 50
                                IssueAlert.transitions(issue, created:).each { IssueAlertJob.perform_later(issue.id, kind, occurrence_id) }  # §11.4
 ```
+
+`counters` is `Ingest::CounterBuffer.current` (§2.5.2): in production the Valkey buffer, which adds the event to Valkey after COMMIT; otherwise `Ingest::DirectCounters` (development, test, `GOODSORCERY_COUNTER_BUFFER=0`), which writes the same rows inside the transaction as its last statements (and leaves every tag value to `Ingest::Rollups`' upsert, as before the buffer). Trimming is a one-in-50 random draw because the fast path has no fresh `events_count` to take a modulo of. The draw trims as often on average and needs no shared state; `TrimOccurrencesJob` is idempotent, and `CapStoredOccurrencesJob` caps each app anyway.
 
 **Issue creation** (only when the plain `SELECT id FROM issues WHERE project_id = ? AND fingerprint = ?` finds nothing):
 `project.allocate_issue_number` (in `IssueTally#prepare`, before the transaction, so the projects row is not locked for the whole transaction), then `Issue.insert({ …, events_count: 0, users_count: 0, status: "unresolved", environments: [env], first_seen_at:, last_seen_at: }, unique_by: %i[project_id fingerprint], returning: %i[id])`. If that loses a race (empty result), reselect the id. The burnt number leaves a harmless gap.
@@ -514,30 +559,115 @@ Ignored issues stay ignored. Only `resolved` regresses.
 
 **Reached production:** `:production` is `EnvironmentTone.production?(event.environment)` and `:production_names` is its coral group (`production prod live`). Environment names are lowercase (ApiKey validates them), so the array overlap is exact. The `environments` tested are the pre-update ones, so an issue created by a production event (environments `[production]`) never qualifies, and the stamp happens once: later events see a production environment and a non-null column. The issue row lock makes concurrent production events of a staging-only issue stamp it exactly once (`concurrent_processing_test.rb`). The processor then inserts one system `reached_production` activity, before the project hourly row as for `regressed`. The issue's existing pointer broadcast refreshes open pages; no new broadcast. The lock is `FOR NO KEY UPDATE`, not `FOR UPDATE`: the occurrence, rollup and activity inserts take `FOR KEY SHARE` on the issue through their foreign keys, and `FOR UPDATE` conflicts with that, which deadlocked concurrent events of one issue (`test/models/ingest/concurrent_processing_test.rb`).
 
-**Rollups** (`Ingest::Rollups#increment_issue`, then `#increment_project` last), all `upsert`/`upsert_all` with `on_duplicate: Arel.sql(...)` and `record_timestamps: false`:
-- `issue_hourly_counts (issue_id, hour)`: `count = issue_hourly_counts.count + 1`
-- `project_hourly_counts (project_id, environment, hour)`: `count + 1`
-- `issue_tag_counts`: one multi-row upsert, rows **sorted by `[key, value_digest]`** to avoid deadlocks; `count + 1`. The encrypted `value` is written only on insert. `Ingest::TagRows` bounds the table per issue: at most `IssueTagCount::VALUES_PER_KEY` (100) values per key, later new values counting towards one "Other values" row (`value_digest = "other"`), and at most `KEYS_PER_ISSUE` (40) keys, later new keys being dropped. Known values cost one indexed lookup.
-- `issue_users` (when the event has an identity): `on_duplicate: "events_count = issue_users.events_count + 1, last_seen_at = GREATEST(issue_users.last_seen_at, EXCLUDED.last_seen_at)"`, `returning: Arel.sql("(xmax = 0) AS inserted")`, so `new_user? = inserted`.
+**Rollups** (`Ingest::Rollups#increment_issue`, then on the slow path `#increment_issue_hour`), all `upsert`/`upsert_all` with `on_duplicate: Arel.sql(...)` and `record_timestamps: false`:
+- `issue_tag_counts`: one multi-row upsert, rows **sorted by `[key, value_digest]`** to avoid deadlocks; `count + 1`. The encrypted `value` is written only on insert. `Ingest::TagRows` bounds the table per issue: at most `IssueTagCount::VALUES_PER_KEY` (100) values per key, later new values counting towards one "Other values" row (`value_digest = "other"`), and at most `KEYS_PER_ISSUE` (40) keys, later new keys being dropped. Known values (and an existing "Other values" row) cost one indexed lookup. With the counter buffer, the upsert holds only values the issue hasn't stored yet; increments of stored ones go to the buffer (`#stored_rows`, §2.5.2). The bounds count distinct rows, and the buffer only adds to rows that exist, so pending increments never change them.
+- `issue_users` (when the event has an identity): `on_duplicate: "events_count = issue_users.events_count + 1, last_seen_at = GREATEST(issue_users.last_seen_at, EXCLUDED.last_seen_at)"`, `returning: Arel.sql("(xmax = 0) AS inserted")`, so `new_user? = inserted`. Always in the transaction: `new_user?` drives `users_count`.
+- `issue_hourly_counts (issue_id, hour)`, slow path only: `count = issue_hourly_counts.count + 1`. The fast path's issue hour, and every event's `project_hourly_counts (project_id, environment, hour)` row, are counted through `Ingest::CounterTotals` (§2.5.1). The project hour is the hour the event was **received**, not its `occurred_at`, so backdated events still count toward this month's quota; the issue hour stays on `occurred_at`.
 
 **Lock ordering and concurrency:**
-- Hot rows are touched last and in a fixed order: per-issue rollups, then the issue counter UPDATE, then the project hourly row (shared by every event of the project, environment and hour) as the last statement before COMMIT. A new issue's number is reserved before the transaction. Transactions stay short.
+- Every processor and the counter flush lock rows in one order: tag and affected-user rows, the issue's hourly row, the issue row, and last the project's hourly row (shared by every event of the project, environment and hour), held only until COMMIT. A new issue's number is reserved before the transaction. Transactions stay short.
+- Every multi-row statement locks its rows in key order. The processors' upserts insert from rows sorted in Ruby; the counter statements (§2.5.1) lock explicitly with `ORDER BY … FOR NO KEY UPDATE`, or insert from an `ORDER BY` select, with strings compared `COLLATE "C"` (byte order, as Ruby sorts). None depends on the join order the planner picks.
 - The job uses `retry_on ActiveRecord::Deadlocked, wait: :polynomially_longer, attempts: 5` and `discard_on ActiveJob::DeserializationError` (the inbound event was already processed).
-- Redelivery is safe: the `inbound_event.destroy!` commits atomically with the counts, and occurrence uniqueness on `(project_id, uuid)` drops client retries.
-- Known ceiling: a single extremely hot issue serialises on its counter rows. Buffering counters in Redis is future work and is not built in v1.
+- Redelivery is safe. The `inbound_event.destroy!` commits atomically with the per-issue rows (and, without a buffer, with the counts), and the buffer adds an event only after that COMMIT, so a retried event is never counted twice. Occurrence uniqueness on `(project_id, uuid)` drops client retries.
+- Known ceiling: with the buffer, an ordinary event of a hot issue locks only rows of its own: its occurrence, its affected user's `issue_users` row and the rows of tag values the issue hasn't stored yet. The occurrence insert takes `FOR KEY SHARE` on the issue row through its foreign key, which neither other events nor the flush's `FOR NO KEY UPDATE` conflict with. What still serialises is a storm from a single user, on that user's row (the user upsert stays in the transaction because `new_user?` drives `users_count`), and slow-path events, on the issue row. Without the buffer (development, test, `GOODSORCERY_COUNTER_BUFFER=0`), a hot issue still serialises on its counter, hourly and tag rows. A local benchmark (forked workers processing 4,000 events of one existing issue, Postgres 14 and Valkey 9.1.3 on one 18-core machine) measured, in events per second: at 4 workers about 1,000 to 1,250 either way; at 8 workers 880 to 1,100 direct and 1,770 to 1,990 buffered; at 16 workers 340 to 620 direct and 1,830 to 1,910 buffered with one user, 2,100 to 3,120 with a new user per event. Buffering `issue_users` and sampling occurrences of hot issues are possible next steps.
+
+#### 2.5.1 Fast path and slow path
+
+The issue row lock exists for state transitions, which alerts depend on (`IssueAlert.transitions` reads `tally.created?`, `previous_status` and `just_reached_production`). Most events of a busy issue can't cause a transition, so they skip the lock.
+
+- **The decision** (`Ingest::IssueTally#settled?`) reads the snapshot that the plain SELECT already returns (`SNAPSHOT_COLUMNS`: id, project_id, status, environments, first_seen_at, reached_production_at; no extra query). An event is settled, and takes the fast path, unless:
+  - the issue is new;
+  - the issue is resolved (a regression);
+  - the event's environment isn't in `environments` yet;
+  - `occurred_at` is older than `first_seen_at`.
+
+  Reaching production needs no check of its own. If a production-like environment is already in `environments`, `COUNT_SQL` never stamps `reached_production_at`, so any event that could reach production brings a new environment. Ignored issues stay ignored and take the fast path.
+- **Fast path:** no issue UPDATE and no hourly upsert in the transaction. The issue's `events_count`, `users_count` and `last_seen_at`, and both hourly rows, go to the counters. The processor returns the snapshot (no counters loaded) for `announce` and `flag_alerts`. The snapshot reports no transition, so nothing alerts.
+- **Slow path:** exactly the locking `COUNT_SQL` above, with the issue counters in it, so a new or regressed issue is already counted when it alerts. Only the project's hourly row goes to the counters, so a storm of new fingerprints doesn't serialise on that row either.
+- **Tag values, with the buffer (both paths):** values the issue has already stored (`Ingest::TagRows#stored_rows`, found by the one indexed lookup it always makes, an existing "Other values" row included) are passed to the counters as `(issue_id, key, value_digest)` triples instead of being upserted, so a hot issue's tag rows aren't locked in the transaction either. New values are still inserted in the transaction, with their encrypted value; they are rare and bounded by `VALUES_PER_KEY` and `KEYS_PER_ISSUE`. Without a buffer, `Ingest::Rollups` upserts every value as before.
+- **Race with a resolve:** the snapshot is read before the transaction, so a member may resolve the issue in between. A fast-path event then counts as if it had been processed just before the resolve: it neither reopens the issue nor alerts. This is accepted; the next event regresses the issue as usual.
+- **`Ingest::CounterTotals`** sums events into stored tag value counts, issue hours, issue counters (`last_seen_at` as a maximum) and project hours. The project hour is the hour the event was received (`received_at`, which the quota counts by), the issue hour the hour it occurred. `#apply` writes them in four statements, in the lock order:
+  1. the tag values: `WITH locked AS MATERIALIZED (SELECT … FROM issue_tag_counts JOIN unnest(…) … ORDER BY issue_id, key COLLATE "C", value_digest COLLATE "C" FOR NO KEY UPDATE OF t) UPDATE issue_tag_counts SET count = count + locked.count …`. Only rows that exist are counted: a value deleted meanwhile (retention prunes the tag rows of issues not seen within it) loses its increment;
+  2. `INSERT INTO issue_hourly_counts … SELECT FROM unnest(…) JOIN issues … ORDER BY issue_id, hour ON CONFLICT DO UPDATE SET count = count + EXCLUDED.count`;
+  3. `WITH locked AS MATERIALIZED (SELECT id FROM issues WHERE id = ANY(…) ORDER BY id FOR NO KEY UPDATE) UPDATE issues … FROM locked JOIN unnest(…)` (`events_count + n`, `users_count + n`, `GREATEST(last_seen_at, …)`, `updated_at`);
+  4. the project hours, written the same way as the issue hours (`ORDER BY project_id, environment COLLATE "C", hour`).
+
+  The joins drop rows of issues or projects deleted meanwhile instead of failing on the foreign key. It writes through `connection.update`, which clears the query cache (jobs run with it on). `#chunks(rows)` splits the rows, in that order and sorted, into totals of at most `rows` rows each, the same way every time. `Ingest::DirectCounters#add_event` applies one event's totals inside the processor's transaction.
+
+#### 2.5.2 Counter buffer and flush
+
+A single hot issue used to serialise on its counter rows and its tag rows. With the buffer, its ordinary events touch none of them in the transaction; Sentry's Redis buffers work the same way.
+
+- **Store:** `config.x.counter_buffer_url`, read once at boot and set in production only, from `REDIS_COUNTERS_URL` or else `REDIS_URL` (the jobs instance, whose `noeviction` and AOF settings suit counters). **Never the LRU cache instance (`REDIS_CACHE_URL`):** an evicted key would lose counts.
+  - `GOODSORCERY_COUNTER_BUFFER=0` (also `false`, `no` or `off`; read at boot into `config.x.counter_buffer_enabled`) makes ingest write counters directly. The flush still drains whatever was already buffered.
+  - Development and test never buffer: they have no Valkey and no scheduler.
+  - Each process keeps one `ConnectionPool` of `redis` clients (`CLIENT_OPTIONS`: 0.5 s connect timeout, 1 s read and write timeouts, `reconnect_attempts: 0`).
+  - **No automatic re-sends.** redis-client otherwise re-sends a command after any connection error, including a read timeout after the command already ran: a re-sent ADD counted the event twice, and a re-sent CLAIM renamed the newer pending hash onto the batch it had already claimed, losing those counts. Only idempotent commands (`SMEMBERS`, `HSCAN`, the final `DEL`/`SREM`) are retried, once, by hand (`store_with_retry`).
+- **Keys** (namespace `goodsorcery:counters`) hold ids, hour starts, environment names, tag keys and tag value digests only (`Ingest::CounterFields`, §2.2 item 5):
+  - `:pending`, a hash with the fields `t:<issue>:<key>:<value digest>`, `ih:<issue>:<hour>`, `e:<issue>`, `u:<issue>` (new users), `l:<issue>` (last seen in epoch µs, kept as a maximum) and `ph:<project>:<hour>:<environment>`;
+  - `:seen:<occurrence id>`, an event's guard (`SEEN_TTL`, 2 minutes), about 100 bytes per event while it lives;
+  - `:batch:<claim ms>:<uuid>`, a claimed batch;
+  - `:batches`, the set of claimed batch ids.
+
+  Every write refreshes a 7-day safety TTL (`KEY_TTL`) on the pending hash and the index; the flush deletes what it applied.
+- **Add** (`#add_event`) runs in `ActiveRecord.after_all_transactions_commit`, so a rolled-back event is never added. It is one round trip: one `EVALSHA` (falling back to `EVAL` after a store restart, when `NOSCRIPT` says the script didn't run) of a Lua script that first takes the event's guard (`SET :seen:<occurrence id> 1 NX EX 120`) and, only if it was free, sets the `l:` maximum and `HINCRBY`s the rest. An add that runs twice for one event counts it once.
+  - **Fallback:** if the store fails, the event's totals are written straight to Postgres in a short transaction instead, in the flush's lock order. When the command may have reached the store (a timeout, a dropped connection, an error reply), the fallback first takes the same guard with `SET NX`: if the script ran, the guard is taken and Postgres doesn't count the event again; if it was free, the script never ran, and a delayed copy arriving later finds the guard taken and adds nothing. When the store couldn't be reached at all (`CannotConnectError`, pool timeout), nothing was sent and Postgres counts the event without a guard.
+  - **The one window left:** the script ran, its reply was lost, and the fallback's `SET NX` fails too (the store went away in between). The event is then counted in Postgres and in the buffer.
+  - **Circuit breaker:** the first failure trips `Ingest::CounterStoreBreaker` (per process and pool) and logs one warning by error class. For the next 5 seconds events skip the store and write straight to Postgres, so a store that is down doesn't make every event wait for its connect timeout; the first event after the window tries it again.
+  - **Never raises:** any other error in the after-commit add (or in its Postgres fallback) is logged by class name and that event's counts are dropped. The processor's announcements and alert flags run after the commit, so an add can never skip them.
+- **Flush** (`FlushIngestCountersJob` → `Ingest::CounterBuffer.configured&.flush`):
+  1. **Single flight:** `CounterFlush.exclusively` takes `pg_try_advisory_lock(4714, 1)` on the job's connection, uncached. A run that finds the lock taken returns at once, and its pending counts roll into the next run. A session-level lock needs no renewal, and Postgres drops it if the process or connection dies, so a crashed flush can't leave it behind. A Valkey lease would need a renewal thread and a token check. **The database connection must be session-pooled:** behind PgBouncer in transaction mode the lock would be taken and released on whatever server connection each statement got. If the unlock finds the lock no longer held, the flush logs a warning.
+  2. **Claim:** a Lua script `RENAME`s `:pending` to `:batch:<now ms>:<uuid>` and `SADD`s the id to `:batches`, atomically. New events start a fresh pending hash. The claim is idempotent: if the batch key already exists, it returns without renaming, so a copy of the same claim can't overwrite the batch with newer counts. A claim that fails (or whose reply is lost) is logged by class; if it ran after all, its batch is recovered as abandoned.
+  3. **Recover:** listed batches claimed more than `RECOVERY_GRACE` (2 minutes) ago were abandoned by a crashed or failed run, and are applied first, with a warning (at most once a minute per process) giving their number and the oldest one's age. The lock already keeps runs apart. The grace also covers a run that lost its database connection (and so its lock) while still working: at twelve intervals, it is far longer than a healthy flush, so a slow but live run's batch is never taken over.
+  4. **Apply in chunks:** each batch is read with `HSCAN` (1,000 fields per reply, so no reply of a big batch runs past the read timeout), decoded and split into chunks of at most `CHUNK_ROWS` (1,000) rows. Each chunk is one short transaction, in the lock order with rows sorted, under `SET LOCAL statement_timeout = 5000` (`CounterFlush::STATEMENT_TIMEOUT`): a statement stuck behind a lock or a slow disk is cancelled and its chunk retried later, instead of holding its locks and the flush lock indefinitely.
+     - 1,000 rows keep each transaction to a few milliseconds of row locks, so a processor waiting on one of its rows is barely delayed, while a busy flush still takes only a handful of transactions.
+     - One global transaction of tens of thousands of rows would instead hold those locks for the whole run.
+  5. **One batch at a time:** a batch that fails (a statement timeout, a store error) is logged with its class and age only, and the run goes on with the next one, so the freshly claimed batch still applies when an abandoned one fails. The failed batch stays listed and is retried as abandoned.
+  6. **Exactly once:** each chunk's transaction first inserts the chunk's ledger id into `counter_flushes` (`id` uuid, `created_at`). The id is `Digest::UUID.uuid_v5` of the batch id and the chunk index. On a conflict, the chunk was applied before and is skipped.
+     - A crash after chunk k of n re-applies only chunks k+1 to n.
+     - A crash between the last COMMIT and deleting the key re-applies nothing.
+     - The ledger is kept for `KEPT_FOR` (8 days, longer than any key can live) and pruned by `goodsorcery:prune`.
+     - Chunking is deterministic, so this holds as long as `CHUNK_ROWS` doesn't change between the crash and the recovery.
+  7. **Clean up and announce:** `MULTI DEL batch, SREM batches`. Then the touched issues and projects get the usual debounced `broadcast_changes_later` (`LiveUpdateGate`: at most one pointer broadcast per issue and project per window, shared with the processors' own). Open pages show the new counts without flooding Action Cable.
+  8. **Logging:** a flush slower than 1 s logs its row count, chunk count and duration at info. One slower than the interval logs at warn, at most once a minute per process. Six runs in a row that find the lock taken (a minute) log a warning that a flush is stuck or slow, at most once a minute per process. Counts, ages, durations and error classes only.
+- **Cadence:** every 10 seconds, on its own `counters` queue (weight 3), so it never waits behind an ingest backlog.
+  - The schedule is a six-field cron line (`*/10 * * * * *`); fugit and sidekiq-cron 2.4 support seconds.
+  - sidekiq-cron polls every 5 seconds (`config/initializers/sidekiq_cron.rb`; Sidekiq spreads the polls between 2.5 and 7.5 s). It enqueues each tick at most once across processes and skips missed ticks.
+  - `sidekiq_options retry: false`: the next run, seconds later, picks up whatever a failed run left behind.
+- **When a flush runs past the interval:** the next ticks find the lock taken and exit. Events keep adding to a fresh pending hash, so nothing is lost: the lag grows by the overrun, and the next run's batch is larger (more chunks, the same lock time per chunk).
+- **What lags,** by up to one interval plus the flush:
+  - `events_count`, `users_count` and `last_seen_at` on the issue list and page, and sorting by them;
+  - the issue charts and 24h histograms;
+  - the tag distributions on the issue page and in the MCP tools (a new value shows at once, with its first count);
+  - `IssueSummary`, `ProjectHealth`, the `ProjectOverview` sparklines and the MCP tools.
+
+  Each of these displays totals refreshed on the next page load or live update, so about 10 s is fine. The still-happening sweep (`IssueHourlyCount::TRAILING_HOUR_SUM`, every 5 minutes) and the monthly quota (`Account::EventQuota`, which sums `project_hourly_counts` and is cached for 5 minutes) already work in minutes. Nothing in ingest reads these counters back: alerts read only the slow path's `COUNT_SQL` result, and the tag bounds count rows, not counts.
+- **Retention:** issue hourly rows are pruned after 31 days and project hourly rows after 90, while a buffered issue hour is at most 30 days old (`occurred_at` is clamped) and a project hour is the hour received. So a flush can't recreate a pruned row, except for a batch recovered days later: its count row would be pruned again at the next daily run. Such a row holds a number only, and nothing reads that far back. Tag value increments never create rows: one whose row was pruned meanwhile is dropped.
+- **Failure modes:**
+  - With AOF `everysec` (the jobs instance), a Valkey crash loses at most about a second of buffered counts. Losing the instance loses what was pending (at most one interval).
+  - A store outage sends counts straight to Postgres, and the breaker skips the store for 5 s at a time.
+  - A lost reply is counted once (the guard), except in the one window described under Add.
+  - A process killed between the COMMIT and the Valkey write (or its fallback) loses that event's counters: the occurrence, its new tag values and its user row are stored, but its issue counters, hourly counts and stored tag value increments are not. The window is one round trip per event in flight.
+  - While Sidekiq is down, nothing flushes: pending counts wait (up to `KEY_TTL`) and apply when it is back.
+  - Rolling back to a release without the flush strands what is pending until the next upgrade (within `KEY_TTL`).
+  - A stuck flush (a lock never released, a statement that hangs) shows as the lock-busy warning; the statement timeout bounds each chunk.
 
 ### 2.6 Query budget
 
 - **Request:** 1 INSERT (multi-row for a batch), plus at most 1 throttled UPDATE (`last_used_at`), plus cache reads and counter increments, plus one (bulk) enqueue.
-- **Job, existing issue:** inbound + project + select issue + occurrence + 4 upserts + issue UPDATE + delete, about 10 statements. A new issue adds 3 more. A regression, and the one event that takes an issue to production, each add one activity INSERT. Alert flagging (§11.4) adds no statement: it reads `tally.created?`, `previous_status` and `just_reached_production`, which the counter UPDATE already returned, and only a transition enqueues a job (`test/models/ingest/alert_flags_test.rb` asserts the 12 statements of an ordinary event).
+- **Job, existing issue:** inbound + project + select issue + occurrence + tag lookup and upsert + issue user + delete. On the fast path with the buffer, the tag upsert goes too when every value is stored already (the usual case for a busy issue): 8 statements inside and around the transaction, plus one Valkey round trip after COMMIT; a new tag value adds the upsert back (and a value past `VALUES_PER_KEY` the bounded counts). Without a buffer, `Ingest::DirectCounters` adds the issue hour, the issue UPDATE and the project hour (12, as before the buffer). The slow path adds the issue hour and the locking counter UPDATE; a new issue adds 3 more, and a regression and the one event that takes an issue to production add one activity INSERT each. Alert flagging (§11.4) adds no statement: it reads `tally.created?`, `previous_status` and `just_reached_production`, which the counter UPDATE (or the snapshot) already returned, and only a transition enqueues a job (`test/models/ingest/alert_flags_test.rb` pins 12 statements for an ordinary event without a buffer and 8 with one).
+- **Flush:** per run, two Valkey calls when idle (no SQL beyond the lock and unlock); otherwise one transaction per chunk (the `statement_timeout`, the ledger insert and at most four statements), plus one issue and one project query for the broadcasts.
 
 ### 2.7 Maintenance (`lib/tasks/goodsorcery.rake`)
 
-- `goodsorcery:prune` deletes occurrences older than `project.retention_days` (`in_batches(of: 1_000).delete_all`), `issue_users` rows and `issue_tag_counts` of issues not seen within it, `issue_hourly_counts` older than 31 days and `project_hourly_counts` older than 90 days (one `hour` slice per DELETE, using the `hour` indexes; project counts are kept longer for the 30d summary comparison and the monthly quota), inbound events still unprocessed after a day (deleted unread, logged by id) and `alert_deliveries` older than `AlertDelivery::KEPT_FOR` (30 days). sidekiq-cron runs it daily as `PruneExpiredDataJob` (`config/schedule.yml`, inside the Sidekiq process), so it needs no host cron; the rake task is for running it by hand.
-- `goodsorcery:requeue_stale` re-enqueues `InboundEvent.stale`.
+- `goodsorcery:prune` deletes occurrences older than `project.retention_days` (`in_batches(of: 1_000).delete_all`), `issue_users` rows and `issue_tag_counts` of issues not seen within it, `issue_hourly_counts` older than 31 days and `project_hourly_counts` older than 90 days (one `hour` slice per DELETE, using the `hour` indexes; project counts are kept longer for the 30d summary comparison and the monthly quota), inbound events still unprocessed after a day (deleted unread, logged by id), `alert_deliveries` older than `AlertDelivery::KEPT_FOR` (30 days) and `counter_flushes` ledger rows older than `CounterFlush::KEPT_FOR` (8 days). sidekiq-cron runs it daily as `PruneExpiredDataJob` (`config/schedule.yml`, inside the Sidekiq process), so it needs no host cron; the rake task is for running it by hand.
+- `goodsorcery:requeue_stale` (and `RequeueStaleEventsJob`, every 10 minutes) re-enqueues `InboundEvent.stale(window)` in batches (`find_each`). During a backlog, an event's job is most likely still waiting, and requeueing it would add a duplicate job per waiting event on every run and fill Redis (`noeviction`). Two guards read the ingest queue latency (§2.1.3):
+  - The window is `InboundEvent::STALE_AFTER` (10 minutes), or the latency plus 5 minutes (`Ingest::StaleEvents::LATENCY_MARGIN`) when that is longer, so a first run during a backlog leaves events whose original job is still queued.
+  - A run is skipped (returns 0) while the jobs of the last requeue are still waiting, that is while the latency is at least the time since that requeue finished. Requeued jobs join the back of the queue but their events keep their `received_at`, so the window alone would requeue them again on every run. The time of the last requeue that enqueued anything is a timestamp in `Rails.cache` (`ingest:stale_events:last_requeue_at`, expires after a day, nothing captured); an evicted entry costs one extra requeue, which is harmless because a processed event's job is discarded.
+  - A job lost while a backlog lasts is therefore requeued only once the queue has worked through the previous batch. An unknown latency keeps the 10 minutes and never skips. Events past the window with no requeue waiting lost their job (a Redis outage) or failed it.
 - `TrimOccurrencesJob` keeps the newest `Occurrence::RETAINED_PER_ISSUE` per issue. The cutoff id is `issue.occurrences.latest_first.offset(100).pick(:id)`.
 - `CapStoredOccurrencesJob` (`Ingest::OccurrenceCap`) holds each project to `Occurrence::RETAINED_PER_PROJECT` (3,000) stored occurrences. One grouped `COUNT` finds the projects over the cap. For each, it computes the level: the most copies every issue can keep, at least 1, with the total within the cap. A `ROW_NUMBER() OVER (PARTITION BY issue_id ORDER BY id DESC)` query picks the ids past each issue's newest level, deleted 1,000 at a time. The issues with the most copies lose their oldest first, and every issue keeps its newest. A project with more issues than the cap stays a little over it. Counters and rollups are unaffected.
-- `config/sidekiq.yml` queues, by weight: `[ingest, 3]`, `[apm, 2]` (performance batches, §13), `[default, 2]` (including the every-minute uptime scheduler), `[alerts, 2]` (alert jobs and sweeps, §11.4), `[uptime, 2]` (the checks, §12.4), `[mailers, 1]`. A Sidekiq process that leaves any of them out silently stops that work, so a dedicated process should only ever take queues away from a process that still runs the rest.
+- `config/sidekiq.yml` queues, by weight: `[ingest, 3]`, `[counters, 3]` (the 10-second counter flush, §2.5.2), `[apm, 2]` (performance batches, §13), `[default, 2]` (including the every-minute uptime scheduler), `[alerts, 2]` (alert jobs and sweeps, §11.4), `[uptime, 2]` (the checks, §12.4), `[mailers, 1]`. A Sidekiq process that leaves any of them out silently stops that work, so a dedicated process should only ever take queues away from a process that still runs the rest.
 
 ---
 
@@ -855,7 +985,7 @@ There is no chart JS, because all charts are server-rendered SVG (§7.4).
 
 ## 5. Caching plan
 
-**Store:** memory store in development, null store in test, Redis cache store in production. Fragment caching applies when `perform_caching` is on.
+**Store:** memory store in development, null store in test, Redis cache store in production (`REDIS_CACHE_URL`, else `REDIS_URL`; the Kamal deploy gives it its own Valkey with `allkeys-lru` and no persistence, so it never shares a database with Sidekiq: the store has no namespace and `clear` would flush Sidekiq's queues). Fragment caching applies when `perform_caching` is on.
 
 | What | Key | TTL | Owner |
 |---|---|---|---|
@@ -1987,6 +2117,8 @@ Both are `ActionController::API` controllers that include **`ApmIngestEndpoint`*
    **Minute → hour rollup happens at write time:** every metrics batch is added to its minute row and to its hour row in the same transaction. There is no rollup job, no watermark and no "late minute" problem: a minute that arrives late (a retried flush) lands in both tables like any other. Minute rows exist only for the short ranges and the last hour; they are pruned after 2 days.
 5. **Traces** (`Apm::TraceUpsert`): each trace is normalised by `Apm::TraceNormalizer` (§13.5), then the batch keeps the slowest per `[transaction_id, minute]` in Ruby, then one `ApmTrace.upsert_all(rows, unique_by: [:apm_transaction_id, :minute], on_duplicate: Arel.sql("<every column> = EXCLUDED.<column> … WHERE EXCLUDED.duration_ms > apm_traces.duration_ms"))`, rows sorted by `[apm_transaction_id, minute]`. A slower trace for the same minute replaces the stored one (new uuid, payload and numbers); a faster or equal one changes nothing. `upsert_all` casts `payload` through the encrypted type (§1.4). If the trailing `WHERE` cannot be expressed through `on_duplicate`, write each SET as `CASE WHEN EXCLUDED.duration_ms > apm_traces.duration_ms THEN EXCLUDED.<col> ELSE apm_traces.<col> END`; the semantics are binding, not the spelling.
 6. Set `processed_at = now` and `body = nil`.
+
+Strings are stripped of null bytes before they reach Postgres (`Apm::JsonShape`, `Apm::TransactionName`, and `Apm::TraceCleaner#text` before scrubbing, which covers `source`). As a backstop, a batch that still fails with `ArgumentError` "string contains null byte" is marked processed with its body cleared and logged as discarded, the way `Ingest::Processor` drops such an event, so it is never retried forever.
 
 Statement budget per batch (asserted in tests): metrics ≤ 8 (lock, registry select, ≤ 1 insert + ≤ 1 re-select, last-seen update, minute upsert, hour upsert, batch update); traces ≤ 7. Log lines carry the batch id, kind and counts only (`"APM batch 123 processed: 42 transactions"`); a processing error is logged and re-raised by class name only, never with a message (Postgres messages can echo row values).
 

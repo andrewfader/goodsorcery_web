@@ -37,6 +37,27 @@ class Ingest::TagRowsTest < ActiveSupport::TestCase
     assert_queries_count(1) { rows("browser" => "Chrome") }
   end
 
+  test "stored and new rows split the rows by whether the issue has the value, an existing Other values row counting as stored" do
+    fill("browser", [ "Chrome" ])
+    fill("request_id", Array.new(IssueTagCount::VALUES_PER_KEY) { "req-#{it}" })
+    tag_rows = Ingest::TagRows.new(@issue.id, "browser" => "Chrome", "release" => "a1", "request_id" => "req-new")
+
+    assert_equal %w[browser], tag_rows.stored_rows.map { it[:key] }
+    assert_equal %w[release request_id], tag_rows.new_rows.map { it[:key] }, "the first Other values row is inserted"
+
+    IssueTagCount.insert({ issue_id: @issue.id, key: "request_id", value_digest: IssueTagCount::OTHER_DIGEST,
+                           value: IssueTagCount::OTHER_VALUE, count: 1 })
+    later = Ingest::TagRows.new(@issue.id, "browser" => "Chrome", "request_id" => "req-newer")
+    assert_equal [ [ "browser", IssueTagCount.value_digest("browser", "Chrome") ], [ "request_id", "other" ] ],
+                 later.stored_rows.map { it.values_at(:key, :value_digest) }
+    assert_empty later.new_rows
+  end
+
+  test "stored values still cost one query" do
+    fill("browser", [ "Chrome" ])
+    assert_queries_count(1) { Ingest::TagRows.new(@issue.id, "browser" => "Chrome").then { [ it.stored_rows, it.new_rows ] } }
+  end
+
   test "the issue page reads capped keys as N+ values" do
     fill("request_id", Array.new(IssueTagCount::VALUES_PER_KEY) { "req-#{it}" })
     IssueTagCount.upsert_all(rows("request_id" => "req-new"), on_duplicate: Arel.sql("count = issue_tag_counts.count + 1"),

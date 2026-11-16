@@ -94,15 +94,67 @@ class Ingest::AlertFlagsTest < ActiveSupport::TestCase
     callback = ->(*, payload) { statements << payload[:sql] unless payload[:name] == "SCHEMA" }
     ActiveSupport::Notifications.subscribed(callback, "sql.active_record") { Ingest::Processor.new(inbound).process }
 
-    # issue SELECT, SAVEPOINT, occurrence, issue hour, tag lookup and upsert,
-    # issue user, counter UPDATE, inbound DELETE, project hour, RELEASE, and
-    # the account read by the live-update broadcast.
+    # Without a buffer (test, like development) the fast path writes its
+    # counters in the transaction: issue SELECT, SAVEPOINT, occurrence, tag
+    # lookup and upsert, issue user, inbound DELETE, then Ingest::DirectCounters'
+    # issue hour, issue UPDATE and project hour, RELEASE, and the account read
+    # by the live-update broadcast. The same 12 as before the buffer; with it,
+    # 8 (next test).
     assert_equal 12, statements.size, statements.join("\n")
     # storefront posts to Slack (fixture): that adds nothing here either.
     assert_predicate projects(:storefront), :slack_alerts_enabled?
     assert_no_match(/alert|notification_preferences|memberships|slack/, statements.join("\n"))
     assert_empty alert_job_args
     assert_no_enqueued_jobs only: SlackPostJob
+  end
+
+  test "with the counter buffer, an ordinary event runs 8 statements and none on a hot row" do
+    process_event(event_json)
+    clear_enqueued_jobs
+    counters = RecordingCounters.new
+    inbound = inbound_event_for(event_json)
+
+    statements = capture_sql { Ingest::Processor.new(inbound, counters:).process }
+
+    # issue SELECT, SAVEPOINT, occurrence, tag lookup, issue user, inbound
+    # DELETE, RELEASE, and the broadcast's account read. The issue's
+    # counters, both hourly rows and the increments of its stored tag values
+    # went to the buffer, after commit; every tag value here is stored
+    # already, so there is no tag upsert (a new value adds one, a value past
+    # VALUES_PER_KEY the bounded counts too). The affected-user upsert
+    # stays (it decides new_user).
+    assert_equal 8, statements.size, statements.join("\n")
+    assert_no_match(/UPDATE "?issues"?|issue_hourly_counts|project_hourly_counts|INSERT INTO "issue_tag_counts"|alert|slack/,
+                    statements.join("\n"))
+    assert_equal 1, counters.events.size
+    assert_empty alert_job_args
+  end
+
+  test "with the counter buffer, transitions still alert exactly as before" do
+    counters = RecordingCounters.new
+    staging = Ingest::Processor.new(inbound_event_for(event_json, key: api_keys(:storefront_staging)), counters:).process
+    assert_equal [ [ staging.id, "new_issue", staging.occurrences.sole.id ] ], alert_job_args
+    Issue.find(staging.id).resolve(by: users(:alex))
+    clear_enqueued_jobs
+
+    Ingest::Processor.new(inbound_event_for(event_json), counters:).process
+    assert_equal %w[reached_production regression], alert_job_args.map(&:second).sort
+    clear_enqueued_jobs
+
+    Ingest::Processor.new(inbound_event_for(event_json), counters:).process
+    assert_empty alert_job_args
+  end
+
+  test "a counter buffer that fails after commit never skips the announcements or the alerts" do
+    failing = Object.new
+    def failing.with = raise(ArgumentError, "simulated bug")
+    counters = Ingest::CounterBuffer.new(failing, namespace: "test:failing")
+
+    issue = nil
+    calls = recording_broadcasts { issue = Ingest::Processor.new(inbound_event_for(event_json), counters:).process }
+
+    assert_equal [ [ issue.id, "new_issue", issue.occurrences.sole.id ] ], alert_job_args
+    assert_includes calls, [ "Issue", issue.id, { created: true } ]
   end
 
   private

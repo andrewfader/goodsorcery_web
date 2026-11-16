@@ -19,7 +19,7 @@ the MIT License.
 </p>
 
 Built with Rails 8.1, Hotwire (Turbo and Stimulus), Action Cable, Postgres,
-Sidekiq, Redis and Tailwind. No single-page JavaScript framework and no Node.js.
+Sidekiq, Valkey (or Redis) and Tailwind. No single-page JavaScript framework and no Node.js.
 
 ## Features
 
@@ -56,7 +56,7 @@ send to app.goodsorcery.com by default, so no endpoint setting is needed.
 ## Self-host
 
 Good Sorcery runs as one Docker image (the web process and a Sidekiq process)
-with Postgres and Redis. `config/deploy.yml` deploys all of it to a single
+with Postgres and Valkey or Redis. `config/deploy.yml` deploys all of it to a single
 server with [Kamal](https://kamal-deploy.org), and plain Docker works too. See
 [Production](#production) below and [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 When self-hosting, point the client libraries at your instance with
@@ -91,7 +91,7 @@ is documented in [docs/INGEST_API.md](docs/INGEST_API.md).
 | Ruby | 4.0.7 | everything | Pinned in `.ruby-version`. With rbenv: `rbenv install 4.0.7`. |
 | Bundler | ships with Ruby | everything | `bin/setup` runs `bundle install`. |
 | PostgreSQL | 14 or newer (the Kamal setup uses 18) | everything | Migrations enable the `pg_trgm` extension (trigram search), which some distributions ship in a separate contrib package. |
-| Redis | 7.0 or newer (or Valkey 7.2+) | production only | Sidekiq jobs, the cache store and Action Cable. Sidekiq 8 refuses older versions. Development and test need no Redis. |
+| Valkey or Redis | Valkey 7.2 or newer, or Redis 7.0 or newer (the Kamal setup uses Valkey 9.1) | production only | Sidekiq jobs, the cache store and Action Cable: one server, or one each with `REDIS_CACHE_URL` and `REDIS_CABLE_URL`. Sidekiq 8 refuses older versions. Development and test need neither. |
 | Google Chrome | current | system tests only | `bin/rails test:system` drives headless Chrome through Selenium. |
 
 Node.js is **not** needed. Tailwind runs through the standalone binary in the
@@ -254,13 +254,24 @@ TEST_DB_SUFFIX=_mine bin/rails db:test:prepare test
 
 ## Production
 
+> **Upgrading existing Kamal installs:** the Kamal setup now runs three Valkey
+> accessories (jobs, cache, Action Cable) instead of one Redis. If you deploy
+> through the GitHub workflow, its deploy job boots them for you
+> (`bin/boot_valkey_accessories`). `bin/kamal deploy` alone doesn't boot
+> accessories, so deploying from a laptop, boot them first from an up-to-date
+> checkout: `bin/kamal accessory boot valkey-jobs` (likewise `valkey-cache` and
+> `valkey-cable`). Until they run, `.kamal/hooks/pre-deploy` stops every deploy
+> before any container changes, so the running version keeps serving. Follow
+> [Moving from one Redis to three Valkey instances](docs/DEPLOYMENT.md#moving-from-one-redis-to-three-valkey-instances)
+> for the whole cutover, including what is lost from the old Redis.
+
 ### Processes
 
 | Process | Command | Notes |
 |---|---|---|
 | Web | `./bin/thrust ./bin/rails server` (the Docker image's default) | Puma behind Thruster on port 80. `bin/docker-entrypoint` runs `bin/rails db:prepare` (create and migrate) before the server starts. |
-| Jobs | `bundle exec sidekiq -C config/sidekiq.yml` | **Required.** Ingest is accepted by the web process but **processed** by Sidekiq. Queues, by weight: `ingest` (3), `apm` (2, performance data), `default` (2, includes the uptime scheduler), `alerts` (2), `uptime` (2, the checks), `mailers` (1). It also runs the scheduled jobs. A process that leaves a queue out silently stops that work. |
-| Redis | Kamal accessory, or external | 7.0 or newer. Sidekiq, the cache store and Action Cable. |
+| Jobs | `bundle exec sidekiq -C config/sidekiq.yml` | **Required.** Ingest is accepted by the web process but **processed** by Sidekiq. Queues, by weight: `ingest` (3), `counters` (3, the 10-second counter flush), `apm` (2, performance data), `default` (2, includes the uptime scheduler), `alerts` (2), `uptime` (2, the checks), `mailers` (1). It also runs the scheduled jobs. A process that leaves a queue out silently stops that work. |
+| Valkey or Redis | Kamal accessories (three Valkey instances), or external | Valkey 7.2+ or Redis 7.0+. Sidekiq's server must not evict keys (`maxmemory-policy noeviction`) and should persist them; the cache store and Action Cable can have their own servers (`REDIS_CACHE_URL`, `REDIS_CABLE_URL`). |
 | Postgres | Kamal accessory, or external | 14 or newer, with `pg_trgm` available. |
 
 Production must be served over **HTTPS**: the app sets `assume_ssl` and
@@ -277,9 +288,10 @@ Sidekiq, so nothing is scheduled there.
 
 | Job | Schedule | Rake task | What it does |
 |---|---|---|---|
+| `FlushIngestCountersJob` | every 10 seconds | none | Adds the event counts buffered in Valkey/Redis (issue counters, hourly counts, tag value counts) to Postgres. Issue and app counts and tag distributions on the dashboard lag by up to about 10 seconds. |
 | `PruneExpiredDataJob` | daily, 03:17 | `bin/rails goodsorcery:prune` | Deletes occurrences older than each app's `retention_days` (30, 60 or 90; default 30), hourly issue counts older than 31 days and app counts older than 90 days, stale personal data on issues past retention, inbound events never processed within a day, old alert deliveries, uptime history and performance data past its retention. |
-| `RequeueStaleEventsJob` | every 10 minutes | `bin/rails goodsorcery:requeue_stale` | Re-enqueues inbound events accepted more than 10 minutes ago but never processed (for example after a Redis outage). |
-| `CapStoredOccurrencesJob` | every 5 minutes | `bin/rails goodsorcery:cap_occurrences` | Holds each app to 3,000 stored occurrences: the issues with the most stored copies lose their oldest first, and every issue keeps at least its newest. Events are still counted. Each issue also keeps at most its newest 100 (`TrimOccurrencesJob`, every 50 events). |
+| `RequeueStaleEventsJob` | every 10 minutes | `bin/rails goodsorcery:requeue_stale` | Re-enqueues inbound events accepted more than 10 minutes ago but never processed (for example after a Redis outage). While the `ingest` queue is behind, it waits for the queue's current wait plus 5 minutes instead, and skips a run while the jobs it requeued last time are still queued, so it doesn't duplicate jobs that are still waiting. |
+| `CapStoredOccurrencesJob` | every 5 minutes | `bin/rails goodsorcery:cap_occurrences` | Holds each app to 3,000 stored occurrences: the issues with the most stored copies lose their oldest first, and every issue keeps at least its newest. Events are still counted. Each issue also keeps at most its newest 100 (`TrimOccurrencesJob`, about one event in 50). |
 | `CheckStillHappeningJob` | every 5 minutes | none | Still-happening alerts for issues over their app's threshold in the last hour. |
 | `SendDailyDigestsJob` | hourly, :00 | none | Daily digests, sent at 09:00 in each recipient's time zone. |
 | `SendAlertSummariesJob` | hourly, :02 | none | One "and N more alerts" email per person for alerts over the hourly cap. |
@@ -304,8 +316,11 @@ Every variable below is read by the server's code or config.
 | `DATABASE_URL` | yes, unless you use the `database.yml` settings below | none | Full Postgres URL. Rails merges it over `config/database.yml`. |
 | `DB_HOST` | if not using `DATABASE_URL` | the local socket | Postgres host for the `goodsorcery_web_production` database (user `goodsorcery_web`). The Kamal config sets it to the `db` accessory. |
 | `GOODSORCERY_WEB_DATABASE_PASSWORD` | if not using `DATABASE_URL` | none | Password for the `goodsorcery_web` role on the `goodsorcery_web_production` database. |
-| `REDIS_URL` | **yes** | `redis://localhost:6379/1` (Action Cable), `redis://localhost:6379/0` (cache), Sidekiq's own default | Sidekiq, Action Cable and, unless overridden, the cache store. |
-| `REDIS_CACHE_URL` | no | `REDIS_URL` | A separate Redis for the cache store (rate limits, quota and key-lookup caches, fragments). |
+| `REDIS_URL` | **yes** | `redis://localhost:6379/1` (Action Cable), `redis://localhost:6379/0` (cache), Sidekiq's own default | Sidekiq's Valkey or Redis server (a `redis://` or `rediss://` URL, which may carry a password). Action Cable and the cache store use it too unless the next two are set. See "Valkey or Redis" for the server flags. |
+| `REDIS_CACHE_URL` | no | `REDIS_URL` | The Rails cache store's server (rate limits, quota and key-lookup caches, fragments). Falls back to `REDIS_URL`. |
+| `REDIS_CABLE_URL` | no | `REDIS_URL` | Action Cable's pub/sub server. Falls back to `REDIS_URL`. |
+| `REDIS_COUNTERS_URL` | no | `REDIS_URL` | Where ingest buffers event counts before flushing them to Postgres every 10 seconds. Must not evict keys: never point it at an LRU cache instance such as `REDIS_CACHE_URL`. Read once at boot. |
+| `GOODSORCERY_COUNTER_BUFFER` | no | on | `0`/`false`/`no`/`off` writes event counts straight to Postgres instead of buffering them (slower under heavy ingest; counts already buffered still flush). Read once at boot. |
 | `SIDEKIQ_CONCURRENCY` | no | `5` | Sidekiq threads per process. Keep `RAILS_MAX_THREADS` (the database pool) at least this high in the Sidekiq process. |
 | `RAILS_MAX_THREADS` | no | `3` Puma threads; database pool `5` | Puma threads per worker and the Active Record pool size. |
 | `WEB_CONCURRENCY` | no | Puma's default (1) | Puma worker processes. `auto` uses one per CPU. |
@@ -316,6 +331,8 @@ Every variable below is read by the server's code or config.
 | `GOODSORCERY_DISABLE_SIGNUPS` | no | none | `1` closes sign-up completely, even before the first account exists. It overrides `ENABLE`. Recommended for a public self-hosted instance; create the owner with `goodsorcery:create_owner` (see "First owner"). |
 | `GOODSORCERY_HOSTED` | no | `false` | `true` (or `1`) marks this as the managed hosting service. Leave it unset when self-hosting. Read once at boot. It turns on entitlements: each account's stored values (`accounts.entitlement_values`) decide its uptime intervals, monitors per app, apps per account, monthly event quota (ingest answers `429 quota_exceeded` past it) and error retention choices, falling back to `config/entitlements.yml`. It also restricts uptime monitor URLs to web ports (see "Uptime checks"), shows "Hosted" in the sidebar and drops the endpoint line from install snippets. Self-hosted (unset), every entitlement is unlimited. After switching it on or off, run `bin/rails goodsorcery:fit_entitlements`. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §12.2–12.3. |
 | `GOODSORCERY_APM_RETENTION_DAYS` | no | `30` | Self-hosted only: days of performance data (hourly figures and slow-request traces) to keep, 1–30. Read once at boot. Hosted accounts use their `apm_retention_days` entitlement instead. Per-minute figures are always kept 2 days. |
+| `GOODSORCERY_INGEST_SHED_AFTER_SECONDS` | no | `120` | When the oldest event waiting in Sidekiq's `ingest` queue has waited this many seconds, the event endpoints answer `429 server_busy` (with `Retry-After: 30`) and store nothing until it catches up. `0` turns this off. Read once at boot; an invalid value falls back to both defaults with a warning. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §2.1.3. |
+| `GOODSORCERY_INGEST_RESUME_BELOW_SECONDS` | no | `30`, or half of the shed-after value when that is less | Events are accepted again once that wait is below this many seconds. Must be at least 1 and less than the shed-after value. |
 | `GOODSORCERY_UPGRADE_URL` | no | none | Hosted mode only. Where the "Upgrade to unlock" link next to locked options goes. Unset, locked options say "Coming soon" and no upgrade text shows. |
 | `GOODSORCERY_TERMS_URL` | no | none | An http(s) link to your Terms of Service. Read once at boot. When set, the sign-up page says "By signing up you agree to the Terms of Service." with it linked. |
 | `GOODSORCERY_PRIVACY_URL` | no | none | An http(s) link to your Privacy Policy, handled the same way. With neither set, the sign-up page shows no agreement sentence. |
@@ -334,8 +351,39 @@ and `CI` (eager loading in tests). The image sets `MAX_REQUEST_BODY` for
 Thruster, which also reads its own variables such as `TLS_DOMAIN`. The Kamal
 deploy reads further variables (`KAMAL_WEB_HOST`, `KAMAL_SSH_PORT`,
 `KAMAL_SSH_USER`, `KAMAL_IMAGE`, `GOODSORCERY_HOST`, the registry login and
-`CLOUDFLARE_TUNNEL_TOKEN`) on the machine that runs Kamal; see
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+`CLOUDFLARE_TUNNEL_TOKEN`, and the optional `KAMAL_VALKEY_*` settings) on the
+machine that runs Kamal; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and its
+[Valkey settings](docs/DEPLOYMENT.md#valkey-settings) table.
+
+### Valkey or Redis
+
+Production needs a Redis-compatible server (Valkey 7.2+ or Redis 7.0+) for
+three roles, each read from its own variable:
+
+| Role | Variable | Falls back to | Recommended server flags |
+|---|---|---|---|
+| Sidekiq jobs | `REDIS_URL` | none (required) | `--maxmemory-policy noeviction --appendonly yes --save ""` (the append-only file without RDB snapshots), plus a `--maxmemory` that fits the host |
+| Rails cache store | `REDIS_CACHE_URL` | `REDIS_URL` | `--maxmemory-policy allkeys-lru --save "" --appendonly no`, plus a `--maxmemory` |
+| Action Cable | `REDIS_CABLE_URL` | `REDIS_URL` | a small `--maxmemory` (32mb is plenty), `--save "" --appendonly no` |
+| Ingest counter buffer | `REDIS_COUNTERS_URL` | `REDIS_URL` | Sidekiq's flags: it must not evict keys and should persist them. Never the cache server |
+
+Sidekiq must never lose keys: with an evicting policy a full server silently
+drops queued jobs, retries and the cron schedule, and without persistence a
+restart loses them. The cache is the opposite: it is fine for it to evict and
+forget, and writing it to disk only costs I/O. Cable pub/sub stores nothing.
+
+One server for all three works for a small install (set only `REDIS_URL`, with
+Sidekiq's flags), but costs two things. The cache can't use LRU eviction, so
+when memory runs out writes fail instead of old keys making room. And the cache
+store has no namespace, so `Rails.cache.clear` runs `FLUSHDB` on the shared
+database, deleting Sidekiq's queues, retries, scheduled jobs and cron schedule
+(and any buffered event counts) with it. Splitting them out takes three servers (or three managed instances)
+and the two extra variables; `config/deploy.yml` does it with three Valkey
+accessories. Managed services work too: put the password in the URL
+(`rediss://:PASSWORD@host:port/0` for TLS), and make sure the jobs instance is
+set to `noeviction` with persistence on. With Kamal, the accessories' sizes and
+flags, and external servers per role, are set through the optional
+deploy-time variables in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#valkey-settings).
 
 ### Secrets
 
@@ -423,7 +471,7 @@ console. Only give accounts to people you trust with all of that.
 ### Deploying with Kamal
 
 `config/deploy.yml` deploys everything to one server: web, Sidekiq, Postgres,
-Redis and a Cloudflare Tunnel (which terminates TLS), so the server publishes
+three Valkey instances (jobs, cache and Action Cable) and a Cloudflare Tunnel (which terminates TLS), so the server publishes
 no HTTP ports. It holds no hosts or secrets; Kamal reads them from the
 environment. In the upstream repository, CI deploys every push to `main` after
 the checks pass. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the server,
@@ -440,7 +488,7 @@ the machine's own architecture, so build on the server, or pass
 docker build -t goodsorcery_web .
 ```
 
-The containers need to reach Postgres and Redis, so put everything on one
+The containers need to reach Postgres and Valkey, so put everything on one
 Docker network. A minimal single-host setup, with Thruster (built into the
 image) getting a Let's Encrypt certificate for your domain:
 
@@ -450,14 +498,14 @@ docker network create goodsorcery
 docker run -d --name goodsorcery-db --network goodsorcery \
   -e POSTGRES_USER=goodsorcery_web -e POSTGRES_PASSWORD=change-me -e POSTGRES_DB=goodsorcery_web_production \
   -v goodsorcery_db:/var/lib/postgresql postgres:18
-docker run -d --name goodsorcery-redis --network goodsorcery \
-  -v goodsorcery_redis:/data redis:8 redis-server --appendonly yes
+docker run -d --name goodsorcery-valkey --network goodsorcery \
+  -v goodsorcery_valkey:/data valkey/valkey:9.1.3 valkey-server --appendonly yes
 
 # Put the variables from "Environment variables" in an env file, for example:
 #   SECRET_KEY_BASE=...  ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY=...  (and the other two keys)
 #   GOODSORCERY_PUBLIC_URL=https://errors.example.com
 #   DATABASE_URL=postgres://goodsorcery_web:change-me@goodsorcery-db/goodsorcery_web_production
-#   REDIS_URL=redis://goodsorcery-redis:6379/0
+#   REDIS_URL=redis://goodsorcery-valkey:6379/0
 #   GOODSORCERY_DISABLE_SIGNUPS=1
 docker run -d --name goodsorcery_web --network goodsorcery --env-file goodsorcery.env \
   -e TLS_DOMAIN=errors.example.com -p 80:80 -p 443:443 \
@@ -474,6 +522,14 @@ the proxy (`assume_ssl` makes Rails treat every request as HTTPS, so the proxy
 must only ever serve the site over HTTPS). Docker-published
 ports bypass host firewalls such as `ufw`; publish only what must be public.
 Then create the first owner (see "First owner").
+
+One Valkey container is enough for a small install, and an existing Redis 7.0+
+container keeps working (`REDIS_URL` takes either). To give the cache and
+Action Cable their own servers, as the Kamal setup does, run two more Valkey
+containers with the flags in "Valkey or Redis" and set `REDIS_CACHE_URL` and
+`REDIS_CABLE_URL`. Without `--maxmemory`, Valkey grows until the host runs out
+of memory, so set one on a small server, keeping
+`--maxmemory-policy noeviction` on the server behind `REDIS_URL`.
 
 ### Self-reporting
 
@@ -525,7 +581,12 @@ unredacted messages need a token with the request data scope ([docs/MCP.md](docs
 - **``Missing `secret_key_base` for 'production' environment`` at boot.** Set `SECRET_KEY_BASE` (the message's `credentials:edit` hint doesn't apply; this app doesn't use credentials).
 - **Sign-in fails with `InvalidAuthenticityToken` or redirects in a loop (production).** The site is being served over plain HTTP. Serve it over HTTPS (see "Processes").
 - **"Blocked hosts" error page in production.** The request's host isn't the public URL's host. Add it to `GOODSORCERY_EXTRA_HOSTS`.
-- **Events return 202 but never appear (production).** Sidekiq isn't running, or it can't reach `REDIS_URL` (Redis 7.0+ is required). Once fixed, run `bin/rails goodsorcery:requeue_stale`.
+- **Events return 202 but never appear (production).** Sidekiq isn't running, or it can't reach `REDIS_URL` (Valkey 7.2+ or Redis 7.0+ is required). With Valkey up and Sidekiq stopped, this only lasts about two minutes: after that, ingest answers `429 server_busy` (next entry). Once fixed, run `bin/rails goodsorcery:requeue_stale`.
+- **Clients get `429 server_busy`.** Sidekiq's `ingest` queue is over two minutes behind (`GOODSORCERY_INGEST_SHED_AFTER_SECONDS`), so new events are turned away until it is under 30 seconds again. The log says `Ingest backlog: started shedding events`. Causes:
+  - Sidekiq is stopped, or no Sidekiq process takes the `ingest` queue (check `config/sidekiq.yml` and any `-q` flags). Start it; shedding stops once the queue has drained.
+  - Not enough capacity for the event rate. Give Sidekiq more (`SIDEKIQ_CONCURRENCY`, or more Sidekiq processes).
+
+  Meanwhile nothing is stored on the server: the client libraries keep events queued in memory, at most about 1,000 each, drop the rest, and resend after `Retry-After`. A client process that exits loses what it held.
 - **Events return 202 but never appear (development).** Check `log/development.log` for job errors. The async adapter runs jobs inside the server process.
 - **401 / 413 / 415 / 422 / 429 from ingest.** See the error table in [docs/INGEST_API.md](docs/INGEST_API.md). A rotated key is rejected right away.
 - **`PG::ConnectionBad`, "database does not exist" or `role "..." does not exist`.** Start Postgres, create a role for your OS user on Linux (see "Requirements"), then run `bin/rails db:prepare`.

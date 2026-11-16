@@ -218,4 +218,71 @@ class Api::V1::EventsControllerTest < ActionDispatch::IntegrationTest
       assert_equal 2, Rails.cache.read("rate-limit:api/v1/events:key:#{api_keys(:storefront_production).id}", raw: true).to_i
     end
   end
+
+  class BacklogTest < ActionDispatch::IntegrationTest
+    include IngestTestSupport
+    include ActiveJob::TestHelper
+
+    setup do
+      @original_cache = Rails.cache
+      Rails.cache = ActiveSupport::Cache::MemoryStore.new
+    end
+
+    teardown { Rails.cache = @original_cache }
+
+    def post_event(token = FIXTURE_TOKENS[:storefront_production], body: minimal_json, content_type: "application/json")
+      post api_v1_events_path, params: body, headers: { "Content-Type" => content_type, "Authorization" => "Bearer #{token}" }
+    end
+
+    def counter(name, id) = Rails.cache.read("rate-limit:api/v1/events:#{name}:#{id}", raw: true).to_i
+
+    test "429 server_busy with a short Retry-After while the ingest queue is too far behind; nothing stored or enqueued" do
+      with_ingest_backlog(150) do
+        assert_no_difference(-> { InboundEvent.count }) { post_event }
+      end
+
+      assert_response :too_many_requests
+      assert_equal({ "error" => "server_busy" }, response.parsed_body)
+      assert_equal "30", response.headers["Retry-After"]
+      assert_no_enqueued_jobs
+    end
+
+    test "a shed request uses up none of the key or account allowance" do
+      with_ingest_backlog(150) { post_event }
+
+      assert_response :too_many_requests
+      assert_equal 0, counter("key", api_keys(:storefront_production).id)
+      assert_equal 0, counter("account", accounts(:acme).id)
+      assert_equal 1, counter("ip", "127.0.0.1"), "the per-IP limit runs first and counts every request"
+    end
+
+    test "sheds before reading the body or checking the quota and media type" do
+      accounts(:acme).update_entitlements!("monthly_event_quota" => 1)
+      with_hosted_mode do
+        with_ingest_backlog(150) { post_event body: "nope", content_type: "text/plain" }
+      end
+
+      assert_response :too_many_requests
+      assert_equal({ "error" => "server_busy" }, response.parsed_body)
+    end
+
+    test "a bad key still gets 401 while shedding" do
+      with_ingest_backlog(150) { post_event "gs_live_unknown" }
+      assert_response :unauthorized
+    end
+
+    test "accepts events below the shed threshold" do
+      with_ingest_backlog(119) do
+        assert_difference(-> { InboundEvent.count }, 1) { post_event }
+      end
+
+      assert_response :accepted
+      assert_enqueued_jobs 1, only: ProcessInboundEventJob
+    end
+
+    test "accepts events whatever the latency when shedding is off" do
+      with_ingest_backlog(10_000, shed_after: 0) { post_event }
+      assert_response :accepted
+    end
+  end
 end

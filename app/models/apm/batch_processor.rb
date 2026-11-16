@@ -11,14 +11,28 @@ class Apm::BatchProcessor
   end
 
   # Returns the number of transactions (metrics) or traces processed, or nil
-  # when there was nothing to do.
+  # when there was nothing to do or the batch was discarded.
   def process
     ApmInboundBatch.uncached do
       ApmInboundBatch.transaction { process_locked }
     end
+  rescue ArgumentError => error
+    # Backstop for a value Postgres cannot store ("string contains null
+    # byte"), so such a batch is dropped instead of retried forever.
+    raise unless error.message.include?("null byte")
+
+    discard
   end
 
   private
+    # Marked processed rather than deleted, so a resend of the same batch_id
+    # still counts as already received.
+    def discard
+      ApmInboundBatch.where(id: @batch_id, processed_at: nil).update_all(processed_at: @now, body: nil)
+      Rails.logger.info { "APM batch #{@batch_id} discarded (unstorable)" }
+      nil
+    end
+
     def process_locked
       batch = ApmInboundBatch.lock("FOR NO KEY UPDATE").find_by(id: @batch_id)
       return if batch.nil? || batch.processed?

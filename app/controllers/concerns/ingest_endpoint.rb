@@ -1,7 +1,11 @@
 # The request checks shared by the ingest endpoints (docs/INGEST_API.md), in
-# the documented order: per-IP rate limit, API key (401), per-key and
-# per-account event limits, monthly quota, media type (415), then, while the
-# action reads the body, size (413) and JSON (400).
+# the documented order: per-IP rate limit, API key (401), ingest backlog (429
+# server_busy), per-key and per-account event limits, monthly quota, media
+# type (415), then, while the action reads the body, size (413) and JSON (400).
+#
+# The backlog check (Ingest::Backlog) reads a per-process memo and never
+# waits; it comes before the event limits, so a shed request uses up no
+# allowance, and before the body is read.
 #
 # The per-IP counter counts requests and is shared by every ingest endpoint
 # (one scope). The key and account counters count events through
@@ -21,6 +25,7 @@ module IngestEndpoint
                scope: Ingest::RateCounter::SCOPE, by: -> { request.remote_ip }, with: -> { render_rate_limited },
                store: Ingest::RateLimitStore
     before_action :authenticate_api_key
+    before_action :shed_when_backlogged
     before_action :limit_event_rate
     before_action :enforce_quota
     before_action :require_json
@@ -35,6 +40,10 @@ module IngestEndpoint
     def max_body_bytes = Ingest::Limits::BODY_BYTES
 
     def event_rate_limit = @event_rate_limit ||= Ingest::EventRateLimit.new(current_api_key)
+
+    def shed_when_backlogged
+      render_server_busy if Ingest::Backlog.current.shedding?
+    end
 
     # One unit of the key and account allowances, before the body is read.
     def limit_event_rate

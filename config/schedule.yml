@@ -2,6 +2,11 @@
 # (production only; development and test don't run Sidekiq). Times are UTC.
 # Jobs removed from this file are unscheduled on the next Sidekiq start.
 
+flush_ingest_counters:
+  cron: "*/10 * * * * *"   # every 10 seconds (six fields; config/initializers/sidekiq_cron.rb polls every 5)
+  class: FlushIngestCountersJob
+  description: "Add the ingest counters buffered in Valkey to Postgres"
+
 prune_expired_data:
   cron: "17 3 * * *"   # daily at 03:17
   class: PruneExpiredDataJob

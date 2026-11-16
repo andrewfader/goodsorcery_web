@@ -5,9 +5,12 @@
 # uptime holds the I/O-bound checks (up to about 20 s each); their
 # every-minute scheduler runs on default so it never waits behind them. See
 # docs/DEPLOYMENT.md to give uptime its own process.
+# counters holds only the 10-second ingest counter flush, so it never waits
+# behind an ingest backlog.
 :concurrency: <%= ENV.fetch("SIDEKIQ_CONCURRENCY", 5) %>
 :queues:
   - [ingest, 3]
+  - [counters, 3]
   - [apm, 2]
   - [default, 2]
   - [alerts, 2]

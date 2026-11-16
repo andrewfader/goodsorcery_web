@@ -35,6 +35,19 @@ class Ingest::PathNormalizerTest < ActiveSupport::TestCase
     assert_equal "src/main.rs", @normalizer.normalize("src/main.rs")
   end
 
+  test "cuts at app/, lib/ and config/ only in Ruby source paths" do
+    assert_equal "config/initializers/goodsorcery.rb", @normalizer.normalize("~/code/shop/config/initializers/goodsorcery.rb")
+    assert_equal "app/views/orders/show.html.erb", @normalizer.normalize("/srv/shop/app/views/orders/show.html.erb")
+    assert_equal "~/proj/node_modules/express/lib/router/index.js",
+                 @normalizer.normalize("/home/u/proj/node_modules/express/lib/router/index.js")
+    assert_equal "/usr/lib/python3.12/json/decoder.py", @normalizer.normalize("/usr/lib/python3.12/json/decoder.py")
+    assert_equal "~/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/panicking.rs",
+                 @normalizer.normalize("/Users/mara/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/panicking.rs")
+    assert_equal "/srv/svc/src/config/mod.rs", @normalizer.normalize("/srv/svc/src/config/mod.rs")
+    assert_equal "/opt/venv/lib/python3.12/site-packages/django/core/handlers/base.py",
+                 @normalizer.normalize("/opt/venv/lib/python3.12/site-packages/django/core/handlers/base.py")
+  end
+
   test "leaves relative and unknown paths alone" do
     assert_equal "app/models/order.rb", @normalizer.normalize("app/models/order.rb")
     assert_equal "/usr/bin/env", @normalizer.normalize("/usr/bin/env")

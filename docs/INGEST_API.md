@@ -138,7 +138,7 @@ Only `exception.class` is required. Every other field is optional, but the more 
 | `context` | object | `start_line` plus up to 11 `lines` of source around `line`. |
 | `locals` | object | Variable name to string, up to 25. |
 
-Absolute paths are normalised server-side as a fallback, for stability across hosts and to keep personal directory names out: deploy and container roots (`/…/releases/<x>/`, `/…/current/`, `/rails/`, `/app/`) are stripped to app-relative paths, RubyGems paths become `gems/<name>-<version>/…`, Cargo registry paths (`…/registry/src/<index>/<crate>-<version>/…`) become `crates/<name>-<version>/…`, Ruby stdlib paths become `ruby/<version>/…` and home directories become `~/`. Any other path is kept as sent.
+Absolute paths are normalised server-side as a fallback, for stability across hosts and to keep personal directory names out: deploy and container roots (`/…/releases/<x>/`, `/…/current/`, `/rails/`, `/app/`) are stripped to app-relative paths, Ruby source files (`.rb`, `.erb`, `.rake`, …) are cut to their first `app/`, `lib/` or `config/` directory (`/srv/shop/app/models/order.rb` becomes `app/models/order.rb`), RubyGems paths become `gems/<name>-<version>/…`, Cargo registry paths (`…/registry/src/<index>/<crate>-<version>/…`) become `crates/<name>-<version>/…`, Ruby stdlib paths become `ruby/<version>/…` and home directories become `~/`. Any other path is kept as sent.
 
 ### Runtimes
 

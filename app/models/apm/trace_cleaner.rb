@@ -10,10 +10,11 @@ class Apm::TraceCleaner
     @paths = Ingest::PathNormalizer.new
   end
 
-  # Null bytes go first: Postgres can't store them in a text column, and
-  # dropping them before scrubbing means one can't split a secret apart.
+  # Scrubbed, cut, then scrubbed and cut again, so a cut can't expose a
+  # secret the whole string hid (Ingest::Scrubber#scrub_text). Scrubbing drops
+  # null bytes first: Postgres can't store them, and one can't split a secret.
   def text(value, max)
-    @scrubber.scrub_text(value.delete("\u0000")).first(max) if value.is_a?(String)
+    @scrubber.scrub_text(@scrubber.scrub_text(value).first(max)).first(max) if value.is_a?(String)
   end
 
   ORIGIN = %r{\A(?:[a-z][a-z0-9+.-]*:)?//[^/?#]*}i

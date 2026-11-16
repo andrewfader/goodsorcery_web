@@ -198,6 +198,12 @@ class Ingest::EventTest < ActiveSupport::TestCase
     assert_equal "[FILTERED]…", event.message.last(11)
   end
 
+  test "scrubs a card the title's length limit cuts loose" do
+    event = build_event(minimal_json(exception: { message: "#{'m' * 1_005} _41111111111111111225 tail" }))
+
+    assert_not_includes event.redacted_message, "4111111111111111"
+  end
+
   test "scrubs frame locals a length limit cuts loose" do
     frame = { file: "app/models/order.rb", line: 1, method: "x", in_app: true, locals: { note: "#{'l' * 482} 41111111111111111225" } }
     event = build_event(minimal_json(exception: { class: "RuntimeError", backtrace: [ frame ] }))
@@ -206,7 +212,7 @@ class Ingest::EventTest < ActiveSupport::TestCase
   end
 
   test "keeps a scrubbed string within its limit" do
-    event = build_event(minimal_json(exception: { message: "#{'m' * 9_990} password=x" }))
+    event = build_event(minimal_json(exception: { message: "#{'m' * 9_970};password:x?,=" }))
 
     assert_operator event.message.length, :<=, Ingest::Limits::MESSAGE
   end

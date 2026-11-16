@@ -56,9 +56,16 @@ class Ingest::Scrubber
     Ingest::TreeLimiter.truncate(scrub_secrets(Ingest::TreeLimiter.truncate(scrubbed, limit)), limit)
   end
 
-  # The same for a tree: scrubbed whole, bounded, then scrubbed again.
+  # The same for a tree: scrubbed whole, bounded, scrubbed again and bounded
+  # again (a second pass can lengthen a string: `;password:x?,=`).
   def scrub_bounded(value, limiter: Ingest::TreeLimiter.new)
-    scrub(limiter.limit(scrub(value)))
+    limiter.limit(scrub(limiter.limit(scrub(value))))
+  end
+
+  # Card numbers only, for text already redacted (the issue title): the other
+  # patterns would rewrite the redactor's placeholders and regroup issues.
+  def scrub_cards(text)
+    text.gsub(CARD_NUMBER_OR_ID) { |found| $~[:id] || !Ingest::Luhn.valid?(found) ? found : FILTERED }
   end
 
   def sensitive_key?(key)
@@ -68,14 +75,10 @@ class Ingest::Scrubber
 
   private
     def scrub_secrets(text)
-      text = scrub_card_numbers(text)
+      text = scrub_cards(text)
       text = text.gsub(CREDENTIAL) { "#{$1} #{FILTERED}" }.gsub(TOKEN_CREDENTIAL) { "#{$1} #{FILTERED}" }.gsub(JWT, FILTERED)
       text = text.gsub(QUERY_PARAM) { sensitive_key?($2) ? "#{$1}#{$2}=#{FILTERED}" : $& }
       scrub_free_text_keys(text.gsub(URL_PASSWORD) { "#{$1}#{FILTERED}@" })
-    end
-
-    def scrub_card_numbers(text)
-      text.gsub(CARD_NUMBER_OR_ID) { |found| $~[:id] || !Ingest::Luhn.valid?(found) ? found : FILTERED }
     end
 
     def scrub_hash(hash)

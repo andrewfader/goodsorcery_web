@@ -487,7 +487,7 @@ When Sidekiq falls behind (an incident upstream sends a flood), accepted events 
     - `Bearer \S+` → `Bearer [FILTERED]`
     - JWT-like `eyJ[\w-]+\.[\w-]+\.[\w-]+` → `[FILTERED]`
     - URL query parameters whose names match the key pattern → `[FILTERED]`
-  - Order: scrub, cut to the §3.4 limits, then scrub again (`Scrubber#scrub_text(text, limit:)` for strings, `#scrub_bounded` for trees; APM's `TraceCleaner#text` and `SqlScrub` do the same). Scrubbing first keeps a card that straddles a limit whole; the second pass catches one the cut exposed (a card glued to an expiry is no card until the cut separates them). Don't drop either pass.
+  - Order: scrub, cut to the §3.4 limits, then scrub again (`Scrubber#scrub_text(text, limit:)` for strings, `#scrub_bounded` for trees; APM's `TraceCleaner#text` and `SqlScrub` do the same). Scrubbing first keeps a card that straddles a limit whole; the second pass catches one the cut exposed (a card glued to an expiry is no card until the cut separates them). Don't drop either pass. The redacted issue title gets a card-only pass after its cut (`Scrubber#scrub_cards`): the full scrub would rewrite the redactor's placeholders and regroup issues.
 - **Fingerprint** (`Ingest::Fingerprint#digest`, SHA-256 hex of the parts joined by `"\x1F"`):
   1. A client `fingerprint` array (≤ 10 strings, each ≤ 200 chars) gives `["custom", *parts]`.
   2. Otherwise, with a top app frame: `["v1", exception_class, frame.file, frame.method_name]`. Line numbers are excluded so edits don't split issues.

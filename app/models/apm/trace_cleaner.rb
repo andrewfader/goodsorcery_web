@@ -1,6 +1,6 @@
 # The string cleaning applied to every captured trace string
-# (docs/ARCHITECTURE.md §13.5): null bytes dropped, capped, scrubbed of secrets by
-# Ingest::Scrubber; paths lose any leading scheme://user:pass@host or //host,
+# (docs/ARCHITECTURE.md §13.5): null bytes dropped, scrubbed of secrets by
+# Ingest::Scrubber, capped, then scrubbed and capped again; paths lose any leading scheme://user:pass@host or //host,
 # their query string and fragment, hosts their user:pass@ part, files are
 # made app-relative, SQL is re-normalised.
 class Apm::TraceCleaner

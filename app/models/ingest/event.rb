@@ -33,7 +33,7 @@ class Ingest::Event
   end
 
   def redacted_message
-    @redacted_message ||= redactor.redact(message)
+    @redacted_message ||= @scrubber.scrub_cards(redactor.redact(message))
   end
 
   def frames

@@ -13,7 +13,7 @@ Client libraries (SDKs), such as the `goodsorcery` Ruby gem and the `goodsorcery
 - **Key check:** `GET {endpoint}/api/v1/verify` confirms a key without sending an event (see [Verifying a key](#verifying-a-key)).
 - **Performance data:** `POST {endpoint}/api/v1/apm/metrics` and `POST {endpoint}/api/v1/apm/traces` (see [Performance monitoring](#performance-monitoring-apm)).
 
-API keys are **ingest-only** and belong to one project environment (for example `production` or `staging`). A key can only submit events. It cannot read anything. Keep keys in server-side configuration and never ship them to browsers or mobile apps.
+API keys are **ingest-only** and belong to one project environment (for example `production` or `staging`). A key can only submit events. It cannot read anything.
 
 ---
 
@@ -107,33 +107,33 @@ Only `exception.class` is required. Every other field is optional, but the more 
 
 | Field | Type | Notes |
 |---|---|---|
-| `event_id` | UUID string | Optional. It makes retries idempotent: a repeated `event_id` within the same project is accepted but counted once. If missing or not a valid UUID, the server generates one (UUIDv7). |
+| `event_id` | UUID string | Optional. It makes retries idempotent: a repeated `event_id` within the same project is accepted but counted once, as long as the first event's occurrence is still stored (each app keeps its latest 3,000 occurrences, within its retention period). If missing or not a valid UUID, the server generates one (UUIDv7). |
 | `occurred_at` | ISO 8601 timestamp | When the error happened. Defaults to the receive time. Values more than 30 days in the past or 5 minutes in the future are replaced by the receive time. |
 | `level` | string | One of `fatal`, `error`, `warning`, `info`. Defaults to `error`. |
 | `release` | string | Version or commit SHA, up to 64 chars. |
-| `transaction` | string | What was running, as the client names it: a handler (`CheckoutsController#create`, `POST /checkout`), a job or task name. The issue list shows a redacted copy (emails, ids, query strings and tokens replaced, as for the title); the original is kept only in the encrypted event. |
+| `transaction` | string | Up to 255 chars. What was running, as the client names it: a handler (`CheckoutsController#create`, `POST /checkout`), a job or task name. The issue list shows a redacted copy (emails, ids, query strings and tokens replaced, as for the title); the original is kept only in the encrypted event. |
 | `exception.class` | string | **Required**, 1–255 chars: the error's type name as the language writes it (`NoMethodError`, `std::io::Error`, `shop::cart::CartError`, `ValueError`). |
 | `exception.message` | string | Up to 10,000 chars. |
 | `exception.backtrace[]` | array of frames | Innermost first. See [Frames](#frames). |
 | `request` | object | `url`, `method`, `format`, `request_id`, `remote_ip`, and the nested objects `params`, `headers` and `session`. Other request keys are dropped. |
 | `job` | object | The background job the error happened in, instead of (or as well as) `request`. Known keys: `framework` (a short name of the job system, shown as sent except `active_job` and `sidekiq`, which display as Active Job and Sidekiq; e.g. `apalis`, `celery`), `class`, `mailer` and `action` (Action Mailer `deliver_later`), `id`, `provider_job_id`, `queue`, `priority`, `executions`, `retry_count` (Sidekiq), `enqueued_at`, `scheduled_at` (strings or numbers, stored as strings of up to 255 chars), and `arguments` (an array, or an object for mailer params). Other job keys are dropped. Arguments are bounded like `request.params` and scrubbed by key at any depth; key filtering cannot protect a secret passed as a bare positional argument, so clients should let apps turn arguments off. Shown on the issue page's Job tab. See [Background jobs](#background-jobs). |
 | `user` | object | `id`, `email`, `username`, `name` (strings or numbers). Other user keys are dropped. The server stores identifiers only as keyed hashes for counting and search. The values themselves are kept encrypted with the event. |
-| `breadcrumbs[]` | array | `timestamp` (ISO 8601), `category` (`request`, `controller`, `sql`, `http`, `cache`, `log`, `job`, `custom`; other values become `custom`), `level` (`debug`, `info`, `warning`, `error`), `message`, and `data` (object). The most recent 100 are kept. |
+| `breadcrumbs[]` | array | `timestamp` (ISO 8601), `category` (`request`, `controller`, `sql`, `http`, `cache`, `log`, `job`, `custom`; other values become `custom`), `level` (`debug`, `info`, `warning`, `error`), `message`, and `data` (object). An unknown `level` becomes `info`. Send them oldest first: the last 100 in the array are kept. |
 | `context` | object | Free-form runtime details shown on the Environment tab. `context.runtime` labels the project (see [Runtimes](#runtimes)); `context.host` adds a `host` tag automatically; `context.process` is a free-form process label. |
-| `tags` | object | String keys matching `/\A[a-z0-9_.\-]{1,32}\z/i` mapped to scalar values (strings, numbers, booleans; stored as strings). Up to 25 pairs; invalid keys and nested values are dropped. Shown as distribution bars on the issue page. The server adds `environment` (always from the key, overriding any client value), `release` and `host` (from `context.host`) unless the client sent those keys. |
-| `fingerprint` | array of strings | Optional custom grouping. Events with the same fingerprint array are grouped into one issue. Up to 10 strings (or numbers), 200 chars each; other values are ignored. |
-| `notifier` | object | `name` and `version` of the client library (`goodsorcery-rust`, `0.1.0`). |
+| `tags` | object | String keys matching `/\A[a-z0-9_.\-]{1,32}\z/i` mapped to scalar values (strings, numbers, booleans; stored as strings). Values up to 200 chars. Up to 25 pairs; invalid keys, nested values and blank values are dropped and don't count toward the 25. Values under keys that match the [scrub list](#privacy-and-scrubbing) (`token`, `session_id`, …) are stored as `[FILTERED]`. Shown as distribution bars on the issue page. The server adds `environment` (always from the key, overriding any client value), `release` and `host` (from `context.host`) unless the client sent those keys. |
+| `fingerprint` | array of strings | Optional custom grouping. Events with the same fingerprint array are grouped into one issue. Up to 10 strings (or numbers), 200 chars each; other values are ignored. A single string is accepted as a one-part fingerprint. |
+| `notifier` | object | `name` and `version` of the client library (`goodsorcery-rust`, `0.1.0`), strings or numbers of up to 128 chars. |
 
 ### Frames
 
 | Field | Type | Notes |
 |---|---|---|
 | `file` | string | The source file, **app-relative** when the client can (`src/cart.rs`, `app/models/order.rb`, `shop/views.py`). Up to 1,024 chars. |
-| `line` | integer | 1-based line number. |
+| `line` | integer | 1-based line number. An integer or a numeric string from 0 to 2,147,483,647; other values are dropped (the same for `column`). |
 | `column` | integer | *Revision 1.1.* Optional 1-based column. Shown after the line (`src/cart.rs:42:17`); grouping and the culprit ignore it. |
 | `method` | string | The function or method name as the language writes it (`line_total`, `shop::cart::line_total`, `CartTotal#line_total`). Up to 255 chars. |
 | `module` | string | *Revision 1.1.* Optional module, namespace or class path (`shop::cart`, `shop.views`). Shown muted before the method unless the method name already starts with it. Up to 255 chars. |
-| `in_app` | boolean | **Send it.** `true` for the app's own code, `false` for the language runtime and libraries. The issue page shows app frames first and folds the rest, and grouping uses the top in-app frame. The server trusts it as sent; only when it is missing does it fall back to a Ruby-layout guess (`app/`, `lib/` and `config/` paths outside `gems/` and `vendor/bundle`), which marks most other layouts as not in-app. |
+| `in_app` | boolean | **Send it.** `true` for the app's own code, `false` for the language runtime and libraries. The issue page shows app frames first and folds the rest, and grouping uses the top in-app frame. The server trusts it as sent; only when it is missing (or not `true` or `false`: `"true"` and `1` count as missing) does it fall back to a Ruby-layout guess (`app/`, `lib/` and `config/` paths outside `gems/` and `vendor/bundle`), which marks most other layouts as not in-app. |
 | `package` | string | *Revision 1.1.* Optional name of the library or crate the frame belongs to (`tokio`, `activerecord`, `django`). Folded framework frames are summarised by package ("3 framework frames hidden (tokio, hyper)"). When missing, the server reads it from a `gems/<name>-<version>/` or `crates/<name>-<version>/` path. Up to 255 chars. |
 | `context` | object | `start_line` plus up to 11 `lines` of source around `line`. |
 | `locals` | object | Variable name to string, up to 25. |
@@ -148,7 +148,7 @@ Absolute paths are normalised server-side as a fallback, for stability across ho
 "runtime": [ { "name": "Rust", "version": "1.82.0" }, { "name": "axum", "version": "0.8.1" } ]
 ```
 
-- `name`: 1–32 characters, letters, digits, spaces and `. _ + # - /` (`Rust`, `Node.js`, `C#`, `Erlang/OTP`). Entries with other names are dropped, because the label is stored as plaintext.
+- `name`: 1–32 characters, starting with a letter or digit, then letters, digits, spaces and `. _ + # - /` (`Rust`, `Node.js`, `C#`, `Erlang/OTP`; a name such as `.NET` is dropped). Surrounding spaces are stripped. Entries with other names are dropped, because the label is stored as plaintext.
 - `version`: a string (or number), up to 64 chars.
 - Up to 10 entries; a repeated name is kept once (the first).
 
@@ -232,20 +232,20 @@ Scrub as much as you can **in the client** (the Ruby gem, for example, applies R
 - Locals sent as objects are scrubbed by key before they are turned into text.
 - User fields `id`, `email`, `username` and `name` are kept as sent (encrypted) because they identify affected users.
 - Job arguments are scrubbed by key like params, and bare string arguments like any other string.
-- Everything captured (backtraces, code context, locals, request, params, headers, session, job, user, breadcrumbs, context and tag values) is stored **encrypted at rest**. The searchable issue title is a redacted copy of the message (emails, IPs, UUIDs, numbers, tokens, query strings and value dumps such as `Failing row contains (…)`, `Key (…)=(…)` and `'column'=value` are replaced with placeholders). The transaction name and culprit shown in the issue list are redacted the same way.
+- Everything captured (backtraces, code context, locals, request, params, headers, session, job, user, breadcrumbs, context and tag values) is stored **encrypted at rest**. The searchable issue title is a redacted copy of the message (emails, IPs, UUIDs, numbers, tokens, query strings and value dumps such as `Failing row contains (…)`, `Key (…)=(…)` and `'column'=value` are replaced with placeholders). The transaction name shown in the issue list is redacted the same way. The culprit (the top in-app frame's file, line and method) is redacted the same way except for numbers, so its line number stays.
 
 ## Responses
 
 | Status | Body | Meaning |
 |---|---|---|
 | `202 Accepted` | `{"id":"0192f7a4-6c1e-7b3a-9d21-5f0c8e1b0aa1"}` | Stored and queued for processing. |
-| `400 Bad Request` | `{"error":"invalid_json"}` | The body is not valid JSON. |
+| `400 Bad Request` | `{"error":"invalid_json"}` | The body is not valid JSON, not valid UTF-8, or not valid gzip. |
 | `401 Unauthorized` | `{"error":"invalid_api_key"}` | Missing, malformed, unknown or rotated key. Includes `WWW-Authenticate: Bearer realm="ingest"`. |
-| `413 Payload Too Large` | `{"error":"payload_too_large"}` | Body over 512 KiB (2 MiB for a batch), compressed or decompressed. |
+| `413 Payload Too Large` | `{"error":"payload_too_large"}` | Body over 512 KiB (2 MiB for a batch), compressed or decompressed. A `Content-Length` over the limit is refused before the body is read. |
 | `415 Unsupported Media Type` | `{"error":"unsupported_media_type"}` | `Content-Type` is not `application/json`, or `Content-Encoding` is neither absent, `identity` nor `gzip`. |
-| `422 Unprocessable Entity` | `{"error":"invalid_payload","messages":["exception.class is required"]}` | Valid JSON with the wrong shape. |
+| `422 Unprocessable Entity` | `{"error":"invalid_payload","messages":["exception.class is required"]}` | Valid JSON with the wrong shape (`body must be a JSON object` when it isn't an object). |
 | `429 Too Many Requests` | `{"error":"rate_limited"}` | Includes a `Retry-After` header in seconds (`60`). A rejected request uses up none of the key's or account's allowance. |
-| `429 Too Many Requests` | `{"error":"quota_exceeded"}` | The account has used its monthly event quota: on the hosted service, 3,000 error events per UTC month unless the account has another quota. Self-hosted instances have no quota. A changed quota applies at the next request; otherwise the answer can lag the count by a few minutes. |
+| `429 Too Many Requests` | `{"error":"quota_exceeded"}` | The account has used its monthly event quota: on the hosted service, 3,000 error events per UTC month unless the account has another quota. Self-hosted instances have no quota. Unlike `rate_limited`, each refused request still uses one unit of the key's and account's per-minute allowance. A changed quota applies at the next request; otherwise the answer can lag the count by a few minutes. |
 | `429 Too Many Requests` | `{"error":"server_busy"}` | *Revision 1.2.* The server is too far behind processing the events it already accepted (overloaded, or its processing workers are stopped) and turns new ones away for now. This can last until the server's operator fixes it, so a client should bound how many events it keeps queued. Includes a short `Retry-After` header in seconds (`30`). Nothing was stored, and none of the key's or account's allowance or quota was used. It applies to every key alike. |
 
 Checks run in this order: per-IP rate limit, API key (`401`), server busy (`429 server_busy`), per-key and per-account rate limits, monthly quota, media type (`415`), body size (`413`), JSON (`400`), shape (`422`). For a batch, the per-key and per-account limits are charged one unit per event: one unit before the body is read (as for a single event, so a key or account with no room left gets `429` straight away), and the rest once the body is parsed and the `events` array checked (after `422` for a malformed array, before the events themselves are validated).
@@ -261,9 +261,9 @@ Clients should retry `429` and `5xx` responses with backoff, reusing the same `e
 ```
 
 - The body is at most **2 MiB**, compressed and decompressed (`413` otherwise).
-- `events` must be an array of **1 to 100** events. A missing, non-array, empty or longer `events` array gets `422 {"error":"invalid_payload","messages":["events must be an array"]}` (or `events must not be empty`, `events must hold at most 100 events`) and nothing is stored.
-- Each event is validated exactly like a single request body and stored on its own. An event that does not validate, or that is over 512 KiB once re-serialised, is rejected by its index; the others are accepted.
-- Rate limits count **events**: a batch of 25 uses 25 of the key's and the account's per-minute allowance, the same allowance single events use one at a time. If the whole batch does not fit, it gets `429` with `Retry-After`, nothing is stored and nothing is used up. A `429 server_busy` (revision 1.2) also refuses the whole batch before its body is read, and uses up nothing. A batch refused as a whole with `400`, `413`, `415` or `422` uses one unit, like a single request. The per-IP limit counts requests.
+- `events` must be an array of **1 to 100** events. A missing, non-array, empty or longer `events` array gets `422 {"error":"invalid_payload","messages":["events must be an array"]}` (or `body must be a JSON object`, `events must not be empty`, `events must hold at most 100 events`) and nothing is stored.
+- Each event is validated exactly like a single request body and stored on its own. An event that does not validate, or that is over 512 KiB once re-serialised, is rejected by its index (an item that isn't an object gets `event must be a JSON object`); the others are accepted.
+- Rate limits count **events**: a batch of 25 uses 25 of the key's and the account's per-minute allowance, the same allowance single events use one at a time. If the whole batch does not fit, it gets `429` with `Retry-After`, nothing is stored and nothing is used up. A `429 server_busy` (revision 1.2) also refuses the whole batch before its body is read, and uses up nothing. A batch refused as a whole with `400`, `413`, `415`, `422` or `429 quota_exceeded` uses one unit, like a single request. The per-IP limit counts requests.
 
 | Status | Body | Meaning |
 |---|---|---|
@@ -360,14 +360,14 @@ Bucket `i` holds durations `d` with `bound[i-1] <= d < bound[i]` (bucket 0 start
 
 | Field | Type | Notes |
 |---|---|---|
-| `batch_id` | UUID string | Optional but recommended. The idempotency key: a payload resent with the same `batch_id` is accepted and counted once. Reuse it when retrying. Missing or invalid → the server generates one (and cannot deduplicate). |
+| `batch_id` | UUID string | Optional but recommended. The idempotency key: a payload resent with the same `batch_id` within a day is accepted and counted once. Reuse it when retrying. Missing or invalid → the server generates one (and cannot deduplicate). |
 | `histogram` | string | **Required**, `"gs-v1"`. Any other value gets `422`. |
 | `notifier` | object | `name` and `version` of the client library. |
 | `minutes[]` | array | **Required**, 1–5 entries, one per minute (a client sends more than one only after a failed flush). |
 | `minutes[].minute` | ISO 8601 timestamp | **Required**, the UTC start of the minute (seconds and fractions must be 0). The minute in which the requests **finished**. Minutes more than 24 hours old or more than 2 minutes in the future are skipped. |
 | `minutes[].transactions[]` | array | **Required**, 1–1,000 entries. A transaction should appear at most once per minute (repeats are added together). |
 | `kind` | string | **Required**, `web` or `job`. |
-| `name` | string | **Required**, 1–255 chars (longer is truncated). `All web requests` and `All background jobs` are reserved for the app-wide totals; data sent under them is counted under `(other)`. |
+| `name` | string | **Required**, 1–255 chars (longer is truncated). `All web requests` (for `web`) and `All background jobs` (for `job`) are reserved for the app-wide totals; data sent under them is counted under `(other)`. |
 | `method`, `route` | strings | Web only; `method` ≤ 16 chars, `route` ≤ 255 chars. Optional. |
 | `adapter`, `queue` | strings | Jobs only; ≤ 32 and ≤ 128 chars. Optional. |
 | `source` | string | Optional, ≤ 500 chars, app-relative. |
@@ -441,10 +441,10 @@ Each request's time is split into four layers. The dashboard shows them as Datab
 |---|---|---|
 | `batch_id` | UUID string | As for metrics. |
 | `traces[]` | array | **Required**, 1–50 traces. |
-| `id` | UUID string | The trace id, a **UUIDv7** (its first 48 bits are the start time in Unix ms). Missing or invalid → generated. |
+| `id` | UUID string | The trace id, preferably a **UUIDv7** (its first 48 bits are the start time in Unix ms); any UUID is accepted. Missing, invalid or already used by another trace → generated. |
 | `kind`, `name`, `method`, `route`, `adapter`, `queue` | | As for metrics; `kind` and `name` are required. |
 | `minute` | ISO 8601 timestamp | **Required**, the UTC start of the minute in which the request finished (the metrics minute). Traces more than 2 hours old or more than 2 minutes in the future are skipped. |
-| `started_at` | ISO 8601 timestamp | **Required**, with milliseconds. |
+| `started_at` | ISO 8601 timestamp | **Required**. Send milliseconds. |
 | `duration_ms` | number | **Required**, ≥ 0. |
 | `db_ms`, `http_ms`, `view_ms`, `app_ms` | numbers | The request's time per [layer](#layers). Revision 1.0 clients send `ruby_ms` for `app_ms`; it is still accepted, and `app_ms` wins when both are sent. |
 | `status` | integer | Web: the HTTP status (500 when an exception escaped). Omit for jobs. |
@@ -477,7 +477,7 @@ The server keeps at most one trace per transaction per minute while that hour is
 | `401 Unauthorized` | `{"error":"invalid_api_key"}` | |
 | `413 Payload Too Large` | `{"error":"payload_too_large"}` | Metrics over 512 KiB, traces over 2 MiB, compressed or decompressed. |
 | `415 Unsupported Media Type` | `{"error":"unsupported_media_type"}` | |
-| `422 Unprocessable Entity` | `{"error":"invalid_payload","messages":["minutes[0].transactions[3].buckets must add up to count"]}` | The payload is checked as a whole; nothing is stored. Messages (at most 20) name fields, never values. |
+| `422 Unprocessable Entity` | `{"error":"invalid_payload","messages":["minutes[0].transactions[3].buckets must add up to count"]}` | The payload is checked as a whole; nothing is stored. A field of the wrong type rejects the whole payload, including an optional label that isn't a string (`method`, `route`, `adapter`, `queue`, `source`, `host`, `process`), a trace `status` outside 0–999 and a `spans` that isn't an array. Messages (at most 20) name fields, never values. |
 | `429 Too Many Requests` | `{"error":"rate_limited"}` | With `Retry-After: 60`. |
 
 Checks run in this order: per-IP rate limit, API key (`401`), per-key and per-account rate limits, media type (`415`), body size (`413`), JSON (`400`), shape (`422`). There is no quota check.
@@ -496,12 +496,14 @@ Clients should keep a payload and retry it (same `batch_id`) on `429` (after `Re
 | Performance metrics | body 512 KiB; 1–5 minutes; 1–1,000 transactions per minute; 500 transaction names per app, environment and kind (more become `(other)`) |
 | Performance traces | body 2 MiB; 1–50 traces; 300 spans per trace; SQL 2,000 chars; code context 5 lines of 200 chars |
 | Tag values | 100 distinct values per tag key per issue (later new values count as "Other values"); 40 tag keys per issue |
-| Apps and keys | 100 apps per account; 10 API keys per app |
-| Exception message | 10,000 chars |
+| Apps and keys | 100 apps per account (on the hosted service, 2 unless the account has another limit); 10 API keys per app |
+| Exception message | 10,000 chars; the issue title made from it ≤ 1,024 chars |
+| `transaction` | 255 chars |
+| `notifier.name`, `notifier.version` | 128 chars each |
 | Backtrace | first 250 frames; context ≤ 11 lines of ≤ 500 chars; ≤ 25 locals of ≤ 500 chars |
 | Breadcrumbs | last 100; message ≤ 1,000 chars; `data` ≤ 20 keys |
 | Tags | 25 pairs; value ≤ 200 chars |
-| `request`, `params`, `headers`, `session`, `context`, `job.arguments` | nesting depth ≤ 6; arrays ≤ 50 items; objects ≤ 100 keys; strings ≤ 4,096 chars |
+| `request`, `params`, `headers`, `session`, `context`, `job.arguments` | nesting depth ≤ 6; arrays ≤ 50 items; objects ≤ 100 keys of ≤ 200 chars; strings ≤ 4,096 chars |
 | Job fields (`job.class`, `job.queue`, …) | 255 chars each |
 | User fields | 255 chars each |
 

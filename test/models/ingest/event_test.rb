@@ -177,6 +177,40 @@ class Ingest::EventTest < ActiveSupport::TestCase
     assert_not_includes event.request.params["note"].last(20), "41111111"
   end
 
+  # The cut lands right after the card's 16th digit: whole, the card is glued
+  # to an expiry (or hex letters) and isn't one; cut, it is.
+  test "scrubs card numbers a length limit cuts loose" do
+    card = "4111111111111111"
+    json = minimal_json(exception: { message: "#{'m' * 9_982} #{card}1225" },
+                        request: { params: { note: "#{'n' * 4_078} #{card}1225" } },
+                        tags: { ref: "#{'t' * 182} #{card}1225" })
+    event = build_event(json)
+
+    assert_not_includes event.message, card
+    assert_not_includes event.request.params["note"], card
+    assert_not_includes event.tags["ref"], card
+    assert_not_includes event.to_payload_json, card
+  end
+
+  test "scrubs a card glued to hex letters once the cut separates them" do
+    event = build_event(minimal_json(exception: { message: "#{'m' * 9_982} 4111111111111111abcd" }))
+
+    assert_equal "[FILTERED]…", event.message.last(11)
+  end
+
+  test "scrubs frame locals a length limit cuts loose" do
+    frame = { file: "app/models/order.rb", line: 1, method: "x", in_app: true, locals: { note: "#{'l' * 482} 41111111111111111225" } }
+    event = build_event(minimal_json(exception: { class: "RuntimeError", backtrace: [ frame ] }))
+
+    assert_not_includes event.frames.first.locals["note"], "4111111111111111"
+  end
+
+  test "keeps a scrubbed string within its limit" do
+    event = build_event(minimal_json(exception: { message: "#{'m' * 9_990} password=x" }))
+
+    assert_operator event.message.length, :<=, Ingest::Limits::MESSAGE
+  end
+
   test "normalises breadcrumbs with offsets relative to occurred_at" do
     crumbs = @event.breadcrumbs
     assert_equal %w[request sql custom], crumbs.map(&:category)

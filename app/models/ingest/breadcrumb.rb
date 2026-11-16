@@ -28,7 +28,7 @@ class Ingest::Breadcrumb < Data.define(:offset_ms, :category, :level, :message, 
       def data(value, scrubber)
         return {} unless value.is_a?(Hash)
 
-        Ingest::TreeLimiter.new.limit(scrubber.scrub(value.first(Ingest::Limits::BREADCRUMB_DATA_KEYS).to_h))
+        scrubber.scrub_bounded(value.first(Ingest::Limits::BREADCRUMB_DATA_KEYS).to_h)
       end
   end
 end

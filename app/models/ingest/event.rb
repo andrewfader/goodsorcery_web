@@ -103,7 +103,7 @@ class Ingest::Event
 
     def hash_at(key) = @data[key].is_a?(Hash) ? @data[key] : {}
 
-    def bounded(value) = Ingest::TreeLimiter.new.limit(@scrubber.scrub(value))
+    def bounded(value) = @scrubber.scrub_bounded(value)
 
     def text(value, max) = Ingest::TreeLimiter.truncate(scalar(value), max)
 

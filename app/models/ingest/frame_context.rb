@@ -5,8 +5,8 @@ class Ingest::FrameContext
   def self.locals(value, scrubber:)
     return {} unless value.is_a?(Hash)
 
-    scrubbed = Ingest::TreeLimiter.new.limit(scrubber.scrub(value.first(Ingest::Limits::LOCALS).to_h))
-    scrubbed.to_h { |name, local| [ name, Ingest::TreeLimiter.truncate(local_text(local), Ingest::Limits::LOCAL_VALUE) ] }
+    scrubbed = scrubber.scrub_bounded(value.first(Ingest::Limits::LOCALS).to_h)
+    scrubbed.to_h { |name, local| [ name, scrubber.scrub_text(local_text(local), limit: Ingest::Limits::LOCAL_VALUE) ] }
   end
 
   def self.local_text(local) = local.is_a?(Hash) || local.is_a?(Array) ? local.to_json : local.to_s

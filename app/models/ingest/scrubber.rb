@@ -44,11 +44,21 @@ class Ingest::Scrubber
     end
   end
 
-  # Scrubs before cutting to limit, so a cut can't leave part of a secret
-  # (a card number's first digits fail the Luhn check) behind.
+  # Scrubs, cuts to limit, then scrubs again. The first pass sees whole
+  # secrets (a cut card number's first digits fail the Luhn check); the second
+  # catches one the cut exposed (a card glued to an expiry is no card until
+  # the cut separates them). The last cut keeps the limit when a placeholder
+  # is longer than what it replaced.
   def scrub_text(text, limit: nil)
     scrubbed = scrub_secrets(text.to_s.delete("\u0000"))
-    limit ? Ingest::TreeLimiter.truncate(scrubbed, limit) : scrubbed
+    return scrubbed unless limit
+
+    Ingest::TreeLimiter.truncate(scrub_secrets(Ingest::TreeLimiter.truncate(scrubbed, limit)), limit)
+  end
+
+  # The same for a tree: scrubbed whole, bounded, then scrubbed again.
+  def scrub_bounded(value, limiter: Ingest::TreeLimiter.new)
+    scrub(limiter.limit(scrub(value)))
   end
 
   def sensitive_key?(key)

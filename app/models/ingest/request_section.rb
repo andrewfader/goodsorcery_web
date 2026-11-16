@@ -22,6 +22,6 @@ class Ingest::RequestSection
   private
     def tree(key)
       value = @request[key]
-      value.is_a?(Hash) ? Ingest::TreeLimiter.new.limit(@scrubber.scrub(value)) : {}
+      value.is_a?(Hash) ? @scrubber.scrub_bounded(value) : {}
     end
 end

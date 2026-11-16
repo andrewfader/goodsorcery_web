@@ -30,6 +30,6 @@ class Ingest::JobSection
 
   private
     def bounded_arguments
-      Ingest::TreeLimiter.new.limit(@scrubber.scrub(@job["arguments"]))
+      @scrubber.scrub_bounded(@job["arguments"])
     end
 end
